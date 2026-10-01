@@ -104,3 +104,18 @@ class Transaction(Base):
 
         logger.warning(f"Transaction {payment_id} not found for update.")
         return None
+
+    @classmethod
+    async def set_status_if_pending(
+        cls, session: AsyncSession, payment_id: str, status: TransactionStatus
+    ) -> bool:
+        result = await session.execute(
+            update(Transaction)
+            .where(
+                Transaction.payment_id == payment_id,
+                Transaction.status == TransactionStatus.PENDING,
+            )
+            .values(status=status)
+        )
+        await session.commit()
+        return result.rowcount == 1

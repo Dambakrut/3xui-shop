@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from abc import ABC, abstractmethod
+from weakref import WeakValueDictionary
 
 from aiogram import Bot
 from aiogram.fsm.storage.redis import RedisStorage
@@ -23,6 +25,15 @@ from app.config import Config
 from app.db.models import Transaction, User
 
 logger = logging.getLogger(__name__)
+_payment_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _payment_lock(payment_id: str) -> asyncio.Lock:
+    lock = _payment_locks.get(payment_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _payment_locks[payment_id] = lock
+    return lock
 
 from app.bot.models import SubscriptionData
 from app.bot.utils.constants import Currency
@@ -66,17 +77,55 @@ class PaymentGateway(ABC):
     async def _on_payment_succeeded(self, payment_id: str) -> None:
         logger.info(f"Payment succeeded {payment_id}")
 
-        async with self.session() as session:
-            transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
-            data = SubscriptionData.unpack(transaction.subscription)
-            logger.debug(f"Subscription data unpacked: {data}")
-            user = await User.get(session=session, tg_id=data.user_id)
+        if not payment_id:
+            logger.warning("Payment success callback has no payment ID.")
+            return
 
-            await Transaction.update(
-                session=session,
-                payment_id=payment_id,
-                status=TransactionStatus.COMPLETED,
-            )
+        async with _payment_lock(payment_id):
+            async with self.session() as session:
+                transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
+                if not transaction:
+                    logger.warning(f"Payment {payment_id} has no matching transaction.")
+                    return
+                if transaction.status != TransactionStatus.PENDING:
+                    logger.info(f"Payment {payment_id} already has status {transaction.status}; ignored.")
+                    return
+                data = SubscriptionData.unpack(transaction.subscription)
+                if data.user_id != transaction.tg_id:
+                    logger.error(f"Payment {payment_id} has mismatched user data; ignored.")
+                    return
+                user = await User.get(session=session, tg_id=transaction.tg_id)
+                if not user:
+                    logger.error(f"Payment {payment_id} has no matching user; ignored.")
+                    return
+
+            if data.is_extend:
+                provisioned = await self.services.vpn.extend_subscription(
+                    user=user, devices=data.devices, duration=data.duration
+                )
+            elif data.is_change:
+                provisioned = await self.services.vpn.change_subscription(
+                    user=user, devices=data.devices, duration=data.duration
+                )
+            else:
+                provisioned = await self.services.vpn.create_subscription(
+                    user=user, devices=data.devices, duration=data.duration
+                )
+
+            if not provisioned:
+                logger.error(f"VPN provisioning failed for payment {payment_id}; transaction remains pending.")
+                return
+
+            async with self.session() as session:
+                completed = await Transaction.set_status_if_pending(
+                    session=session, payment_id=payment_id, status=TransactionStatus.COMPLETED
+                )
+            if not completed:
+                logger.critical(
+                    f"VPN provisioning succeeded for payment {payment_id}, but completion failed. "
+                    "Manual reconciliation is required."
+                )
+                return
 
         if self.config.shop.REFERRER_REWARD_ENABLED:
             await self.services.referral.add_referrers_rewards_on_payment(
@@ -107,33 +156,18 @@ class PaymentGateway(ABC):
             )
 
             if data.is_extend:
-                await self.services.vpn.extend_subscription(
-                    user=user,
-                    devices=data.devices,
-                    duration=data.duration,
-                )
                 logger.info(f"Subscription extended for user {user.tg_id}")
                 await self.services.notification.notify_extend_success(
                     user_id=user.tg_id,
                     data=data,
                 )
             elif data.is_change:
-                await self.services.vpn.change_subscription(
-                    user=user,
-                    devices=data.devices,
-                    duration=data.duration,
-                )
                 logger.info(f"Subscription changed for user {user.tg_id}")
                 await self.services.notification.notify_change_success(
                     user_id=user.tg_id,
                     data=data,
                 )
             else:
-                await self.services.vpn.create_subscription(
-                    user=user,
-                    devices=data.devices,
-                    duration=data.duration,
-                )
                 logger.info(f"Subscription created for user {user.tg_id}")
                 key = await self.services.vpn.get_key(user)
                 await self.services.notification.notify_purchase_success(
@@ -143,15 +177,19 @@ class PaymentGateway(ABC):
 
     async def _on_payment_canceled(self, payment_id: str) -> None:
         logger.info(f"Payment canceled {payment_id}")
-        async with self.session() as session:
-            transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
-            data = SubscriptionData.unpack(transaction.subscription)
-
-            await Transaction.update(
-                session=session,
-                payment_id=payment_id,
-                status=TransactionStatus.CANCELED,
-            )
+        if not payment_id:
+            return
+        async with _payment_lock(payment_id):
+            async with self.session() as session:
+                transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
+                if not transaction or transaction.status != TransactionStatus.PENDING:
+                    return
+                data = SubscriptionData.unpack(transaction.subscription)
+                canceled = await Transaction.set_status_if_pending(
+                    session=session, payment_id=payment_id, status=TransactionStatus.CANCELED
+                )
+                if not canceled:
+                    return
 
         await self.services.notification.notify_developer(
             text=EVENT_PAYMENT_CANCELED_TAG

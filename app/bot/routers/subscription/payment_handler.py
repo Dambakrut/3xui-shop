@@ -94,20 +94,27 @@ async def successful_payment(
     bot: Bot,
     gateway_factory: GatewayFactory,
 ) -> None:
-    if await IsDev()(user_id=user.tg_id):
-        await bot.refund_star_payment(
-            user_id=user.tg_id,
-            telegram_payment_charge_id=message.successful_payment.telegram_payment_charge_id,
-        )
-
     data = SubscriptionData.unpack(message.successful_payment.invoice_payload)
+    payment_id = message.successful_payment.telegram_payment_charge_id
     transaction = await Transaction.create(
         session=session,
         tg_id=user.tg_id,
         subscription=data.pack(),
-        payment_id=message.successful_payment.telegram_payment_charge_id,
-        status=TransactionStatus.COMPLETED,
+        payment_id=payment_id,
+        status=TransactionStatus.PENDING,
     )
 
+    if transaction and await IsDev()(user_id=user.tg_id):
+        await bot.refund_star_payment(
+            user_id=user.tg_id,
+            telegram_payment_charge_id=payment_id,
+        )
+
+    if not transaction:
+        transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
+    if not transaction or transaction.tg_id != user.tg_id or transaction.subscription != data.pack():
+        logger.error(f"Stars payment {payment_id} has no matching transaction.")
+        return
+
     gateway = gateway_factory.get_gateway(NavSubscription.PAY_TELEGRAM_STARS)
-    await gateway.handle_payment_succeeded(payment_id=transaction.payment_id)
+    await gateway.handle_payment_succeeded(payment_id=payment_id)
