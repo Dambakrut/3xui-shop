@@ -35,10 +35,10 @@ class ServerPoolService:
             )
             try:
                 await api.login()
-                server.online = True
-                server_conn = Connection(server=server, api=api)
-                self._servers[server.id] = server_conn
-                logger.info(f"Server {server.name} ({server.host}) added to pool successfully.")
+                server.online = await self.validate_configured_inbound(api)
+                if server.online:
+                    self._servers[server.id] = Connection(server=server, api=api)
+                    logger.info(f"Server {server.name} ({server.host}) added to pool successfully.")
             except Exception as exception:
                 server.online = False
                 logger.error(f"Failed to add server {server.name} ({server.host}): {exception}")
@@ -60,13 +60,24 @@ class ServerPoolService:
         await self._add_server(server)
         logger.info(f"Server {server.name} reinitialized successfully.")
 
-    async def get_inbound_id(self, api: AsyncApi) -> int | None:
+    async def validate_configured_inbound(self, api: AsyncApi) -> bool:
         try:
             inbounds = await api.inbound.get_list()
         except Exception as exception:
-            logger.error(f"Failed to fetch inbounds: {exception}")
-            return None
-        return inbounds[0].id
+            logger.error(f"Failed to validate XUI_INBOUND_ID={self.config.xui.INBOUND_ID}: {exception}")
+            return False
+        if not isinstance(inbounds, list) or not all(
+            isinstance(getattr(inbound, "id", None), int) for inbound in inbounds
+        ):
+            logger.error("3x-ui returned an invalid inbound list; provisioning disabled.")
+            return False
+        if not any(inbound.id == self.config.xui.INBOUND_ID for inbound in inbounds):
+            logger.error(
+                f"XUI_INBOUND_ID={self.config.xui.INBOUND_ID} is absent from 3x-ui; "
+                "provisioning disabled."
+            )
+            return False
+        return True
 
     async def get_connection(self, user: User) -> Connection | None:
         if not user.server_id:
@@ -125,11 +136,20 @@ class ServerPoolService:
 
         logger.info(f"Sync complete. Currently active servers: {len(self._servers)}")
 
-    async def assign_server_to_user(self, user: User) -> None:
+    async def assign_server_to_user(self, user: User, server: Server) -> bool:
         async with self.session() as session:
-            server = await self.get_available_server()
-            user.server_id = server.id
-            await User.update(session=session, tg_id=user.tg_id, server_id=server.id)
+            updated = await User.update(session=session, tg_id=user.tg_id, server_id=server.id)
+        if not updated:
+            logger.error(f"Failed to assign server {server.id} to user {user.tg_id} after client creation.")
+            return False
+        user.server_id = server.id
+        return True
+
+    async def get_provisioning_connection(self) -> Connection | None:
+        server = await self.get_available_server()
+        if not server:
+            return None
+        return self._servers.get(server.id)
 
     async def get_available_server(self) -> Server | None:
         await self.sync_servers()

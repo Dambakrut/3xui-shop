@@ -97,6 +97,7 @@ class XUIConfig:
     USERNAME: str
     PASSWORD: str
     TOKEN: str | None
+    INBOUND_ID: int
     SUBSCRIPTION_PORT: int
     SUBSCRIPTION_PATH: str
 
@@ -172,9 +173,21 @@ class Config:
     logging: LoggingConfig
 
 
+def parse_xui_inbound_id(raw: str | None) -> int:
+    try:
+        inbound_id = int(raw) if raw is not None else 0
+    except ValueError as exception:
+        raise ValueError("XUI_INBOUND_ID must be an integer greater than 0") from exception
+    if inbound_id <= 0:
+        raise ValueError("XUI_INBOUND_ID is required and must be an integer greater than 0")
+    return inbound_id
+
+
 def load_config() -> Config:
     env = Env()
     env.read_env()
+
+    inbound_id = parse_xui_inbound_id(env.str("XUI_INBOUND_ID", default=None))
 
     bot_admins = env.list("BOT_ADMINS", subcast=int, default=[], required=False)
     if not bot_admins:
@@ -341,6 +354,7 @@ def load_config() -> Config:
             USERNAME=env.str("XUI_USERNAME"),
             PASSWORD=env.str("XUI_PASSWORD"),
             TOKEN=xui_token,
+            INBOUND_ID=inbound_id,
             SUBSCRIPTION_PORT=env.int("XUI_SUBSCRIPTION_PORT", default=DEFAULT_SUBSCRIPTION_PORT),
             SUBSCRIPTION_PATH=env.str(
                 "XUI_SUBSCRIPTION_PATH",

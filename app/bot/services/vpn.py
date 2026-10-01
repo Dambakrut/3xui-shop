@@ -62,9 +62,14 @@ class VPNService:
             logger.error(f"Failed to fetch inbounds: {exception}")
             return None
 
+        if not isinstance(inbounds, list):
+            logger.error("3x-ui returned an invalid inbound list.")
+            return None
         for inbound in inbounds:
+            if inbound.id != self.config.xui.INBOUND_ID:
+                continue
             for inbound_client in inbound.settings.clients:
-                if inbound_client.email == client.email:
+                if inbound_client.email == client.email and inbound_client.id == user.vpn_id:
                     logger.debug(f"Client {client.email} limit ip: {inbound_client.limit_ip}")
                     return inbound_client.limit_ip
 
@@ -140,14 +145,19 @@ class VPNService:
         enable: bool = True,
         flow: str = "xtls-rprx-vision",
         total_gb: int = 0,
-        inbound_id: int = 1,
     ) -> bool:
         logger.info(f"Creating new client {user.tg_id} | {devices} devices {duration} days.")
 
-        await self.server_pool_service.assign_server_to_user(user)
-        connection = await self.server_pool_service.get_connection(user)
+        connection = (
+            await self.server_pool_service.get_connection(user)
+            if user.server_id
+            else await self.server_pool_service.get_provisioning_connection()
+        )
 
         if not connection:
+            return False
+
+        if not await self.server_pool_service.validate_configured_inbound(connection.api):
             return False
 
         new_client = Client(
@@ -160,10 +170,15 @@ class VPNService:
             sub_id=user.vpn_id,
             total_gb=total_gb,
         )
-        inbound_id = await self.server_pool_service.get_inbound_id(connection.api)
-
         try:
-            await connection.api.client.add(inbound_id=inbound_id, clients=[new_client])
+            await connection.api.client.add(
+                inbound_id=self.config.xui.INBOUND_ID, clients=[new_client]
+            )
+            if not user.server_id and not await self.server_pool_service.assign_server_to_user(
+                user, connection.server
+            ):
+                logger.critical(f"Client {user.tg_id} was created but server assignment failed.")
+                return False
             logger.info(f"Successfully created client for {user.tg_id}")
             return True
         except Exception as exception:
@@ -194,8 +209,16 @@ class VPNService:
                 logger.critical(f"Client {user.tg_id} not found for update.")
                 return False
 
+            if client.id != user.vpn_id:
+                logger.error(f"Client UUID mismatch for user {user.tg_id}; update refused.")
+                return False
+
+            current_device_limit = await self.get_limit_ip(user=user, client=client)
+            if current_device_limit is None:
+                logger.error(f"Client {user.tg_id} is absent from configured inbound; update refused.")
+                return False
+
             if not replace_devices:
-                current_device_limit = await self.get_limit_ip(user=user, client=client)
                 devices = current_device_limit + devices
 
             current_time = get_current_timestamp()
