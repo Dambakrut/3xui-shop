@@ -71,7 +71,9 @@ from typing import Any, Optional
 
 class TransactionStatus(Enum):
     PENDING = "pending"
+    PROCESSING = "processing"
     COMPLETED = "completed"
+    REVIEW_REQUIRED = "review_required"
     CANCELED = "canceled"
     REFUNDED = "refunded"
 

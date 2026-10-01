@@ -109,13 +109,37 @@ class Transaction(Base):
     async def set_status_if_pending(
         cls, session: AsyncSession, payment_id: str, status: TransactionStatus
     ) -> bool:
+        if status not in (TransactionStatus.PROCESSING, TransactionStatus.CANCELED):
+            raise ValueError(f"Invalid transition from pending to {status}")
         result = await session.execute(
             update(Transaction)
             .where(
                 Transaction.payment_id == payment_id,
                 Transaction.status == TransactionStatus.PENDING,
             )
-            .values(status=status)
+            .values(status=status, updated_at=func.now())
+        )
+        await session.commit()
+        return result.rowcount == 1
+
+    @classmethod
+    async def set_status_if_processing(
+        cls,
+        session: AsyncSession,
+        payment_id: str,
+        status: TransactionStatus,
+        updated_before: datetime | None = None,
+    ) -> bool:
+        if status not in (TransactionStatus.COMPLETED, TransactionStatus.REVIEW_REQUIRED):
+            raise ValueError(f"Invalid transition from processing to {status}")
+        conditions = [
+            Transaction.payment_id == payment_id,
+            Transaction.status == TransactionStatus.PROCESSING,
+        ]
+        if updated_before is not None:
+            conditions.append(Transaction.updated_at <= updated_before)
+        result = await session.execute(
+            update(Transaction).where(*conditions).values(status=status, updated_at=func.now())
         )
         await session.commit()
         return result.rowcount == 1

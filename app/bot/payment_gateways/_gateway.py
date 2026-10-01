@@ -99,27 +99,74 @@ class PaymentGateway(ABC):
                     logger.error(f"Payment {payment_id} has no matching user; ignored.")
                     return
 
-            if data.is_extend:
-                provisioned = await self.services.vpn.extend_subscription(
-                    user=user, devices=data.devices, duration=data.duration
+                # The database claim, not the process-local lock, owns provisioning.
+                claimed = await Transaction.set_status_if_pending(
+                    session=session, payment_id=payment_id, status=TransactionStatus.PROCESSING
                 )
-            elif data.is_change:
-                provisioned = await self.services.vpn.change_subscription(
-                    user=user, devices=data.devices, duration=data.duration
-                )
-            else:
-                provisioned = await self.services.vpn.create_subscription(
-                    user=user, devices=data.devices, duration=data.duration
-                )
+                if not claimed:
+                    logger.info(f"Payment {payment_id} was claimed or canceled elsewhere; ignored.")
+                    return
+
+            try:
+                if data.is_extend:
+                    provisioned = await self.services.vpn.extend_subscription(
+                        user=user, devices=data.devices, duration=data.duration
+                    )
+                elif data.is_change:
+                    provisioned = await self.services.vpn.change_subscription(
+                        user=user, devices=data.devices, duration=data.duration
+                    )
+                else:
+                    provisioned = await self.services.vpn.create_subscription(
+                        user=user, devices=data.devices, duration=data.duration
+                    )
+            except Exception:
+                logger.exception("VPN provisioning raised for payment %s; reconciliation required.", payment_id)
+                provisioned = False
 
             if not provisioned:
-                logger.error(f"VPN provisioning failed for payment {payment_id}; transaction remains pending.")
+                # False can also mean that 3x-ui applied a request before a timeout.
+                try:
+                    async with self.session() as session:
+                        marked = await Transaction.set_status_if_processing(
+                            session=session, payment_id=payment_id,
+                            status=TransactionStatus.REVIEW_REQUIRED,
+                        )
+                    if not marked:
+                        logger.critical(
+                            "Payment %s could not transition from PROCESSING to REVIEW_REQUIRED; "
+                            "inspect its current state.", payment_id
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not mark payment %s for review; stale PROCESSING recovery is required.",
+                        payment_id,
+                    )
+                logger.error("VPN provisioning outcome for payment %s requires reconciliation.", payment_id)
                 return
 
-            async with self.session() as session:
-                completed = await Transaction.set_status_if_pending(
-                    session=session, payment_id=payment_id, status=TransactionStatus.COMPLETED
+            try:
+                async with self.session() as session:
+                    completed = await Transaction.set_status_if_processing(
+                        session=session, payment_id=payment_id, status=TransactionStatus.COMPLETED
+                    )
+            except Exception:
+                logger.exception(
+                    "VPN provisioning succeeded for payment %s, but DB completion failed; "
+                    "manual reconciliation is required.", payment_id
                 )
+                try:
+                    async with self.session() as session:
+                        await Transaction.set_status_if_processing(
+                            session=session, payment_id=payment_id,
+                            status=TransactionStatus.REVIEW_REQUIRED,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not mark payment %s for review after DB completion failure; "
+                        "stale PROCESSING recovery is required.", payment_id
+                    )
+                return
             if not completed:
                 logger.critical(
                     f"VPN provisioning succeeded for payment {payment_id}, but completion failed. "

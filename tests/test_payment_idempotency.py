@@ -16,7 +16,9 @@ from test_safe_inbound import ROOT, SessionContext, load_definitions
 
 class Status(Enum):
     PENDING = "pending"
+    PROCESSING = "processing"
     COMPLETED = "completed"
+    REVIEW_REQUIRED = "review_required"
     CANCELED = "canceled"
     REFUNDED = "refunded"
 
@@ -34,6 +36,9 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.records = {"payment-1": self.transaction}
         records = self.records
+        parent = self
+        self.completion_error = False
+        self.review_error = False
 
         class FakeTransaction:
             @classmethod
@@ -44,6 +49,18 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             async def set_status_if_pending(cls, session, payment_id, status):
                 transaction = records.get(payment_id)
                 if not transaction or transaction.status != Status.PENDING:
+                    return False
+                transaction.status = status
+                return True
+
+            @classmethod
+            async def set_status_if_processing(cls, session, payment_id, status, updated_before=None):
+                transaction = records.get(payment_id)
+                if status == Status.COMPLETED and parent.completion_error:
+                    raise RuntimeError("DB completion unavailable")
+                if status == Status.REVIEW_REQUIRED and parent.review_error:
+                    raise RuntimeError("DB review unavailable")
+                if not transaction or transaction.status != Status.PROCESSING:
                     return False
                 transaction.status = status
                 return True
@@ -103,7 +120,7 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_pending_payment_provisions_then_completes(self):
         async def provision(**kwargs):
-            self.assertEqual(self.transaction.status, Status.PENDING)
+            self.assertEqual(self.transaction.status, Status.PROCESSING)
             return True
 
         self.vpn.extend_subscription.side_effect = provision
@@ -125,20 +142,52 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.referral.add_referrers_rewards_on_payment.assert_awaited_once()
         self.notification.notify_extend_success.assert_awaited_once()
 
-    async def test_provisioning_failure_keeps_pending(self):
+    async def test_provisioning_failure_requires_review(self):
         self.vpn.extend_subscription.return_value = False
         await self.gateway.handle_payment_succeeded("payment-1")
-        self.assertEqual(self.transaction.status, Status.PENDING)
+        self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
         self.referral.add_referrers_rewards_on_payment.assert_not_awaited()
 
-    async def test_retry_after_provisioning_failure(self):
+    async def test_duplicate_after_provisioning_failure_does_not_retry(self):
         self.vpn.extend_subscription.side_effect = [False, True]
         await self.gateway.handle_payment_succeeded("payment-1")
-        self.assertEqual(self.transaction.status, Status.PENDING)
+        self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
         await self.gateway.handle_payment_succeeded("payment-1")
-        self.assertEqual(self.transaction.status, Status.COMPLETED)
-        self.assertEqual(self.vpn.extend_subscription.await_count, 2)
-        self.referral.add_referrers_rewards_on_payment.assert_awaited_once()
+        self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
+        self.vpn.extend_subscription.assert_awaited_once()
+        self.referral.add_referrers_rewards_on_payment.assert_not_awaited()
+
+    async def test_provisioning_exception_requires_review(self):
+        self.vpn.extend_subscription.side_effect = TimeoutError("unknown outcome")
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
+        self.referral.add_referrers_rewards_on_payment.assert_not_awaited()
+
+    async def test_completion_db_failure_does_not_return_to_pending(self):
+        self.completion_error = True
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.vpn.extend_subscription.assert_awaited_once()
+        self.referral.add_referrers_rewards_on_payment.assert_not_awaited()
+
+    async def test_persistent_db_failure_leaves_processing_until_recovery(self):
+        self.completion_error = True
+        self.review_error = True
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.assertEqual(self.transaction.status, Status.PROCESSING)
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.vpn.extend_subscription.assert_awaited_once()
+
+    async def test_processing_duplicate_does_not_provision(self):
+        self.transaction.status = Status.PROCESSING
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.vpn.extend_subscription.assert_not_awaited()
+
+    async def test_review_duplicate_does_not_provision(self):
+        self.transaction.status = Status.REVIEW_REQUIRED
+        await self.gateway.handle_payment_succeeded("payment-1")
+        self.vpn.extend_subscription.assert_not_awaited()
 
     async def test_missing_or_invalid_transaction_does_not_provision(self):
         await self.gateway.handle_payment_succeeded("missing")
