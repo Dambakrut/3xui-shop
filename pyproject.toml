@@ -7,19 +7,23 @@ readme = "README.md"
 package-mode = false
 
 [tool.poetry.dependencies]
-python = "^3.12"
-aiogram = "^3.15.0"
-babel = "^2.16.0"
-environs = "^11.2.1"
-cachetools = "^5.5.0"
-py3xui = "^0.3.2"
-yookassa = "^3.4.3"
-sqlalchemy = {extras = ["asyncio"], version = "^2.0.36"}
-aiosqlite = "^0.20.0"
-alembic = "^1.14.0"
-redis = "^5.2.1"
-apscheduler = "^3.11.0"
+python = ">=3.12,<3.13"
+aiogram = "3.15.0"
+babel = "2.16.0"
+environs = "11.2.1"
+cachetools = "5.5.0"
+py3xui = "0.3.2"
+yookassa = "3.4.3"
+sqlalchemy = {extras = ["asyncio"], version = "2.0.36"}
+aiosqlite = "0.20.0"
+alembic = "1.14.0"
+redis = "5.2.1"
+apscheduler = "3.11.0"
+# Direct imports must not rely on another package pulling these in.
+aiohttp = "3.10.11"
+requests = ">=2.32,<3"
+marshmallow = ">=3.13,<4"
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core==2.1.3"]
 build-backend = "poetry.core.masonry.api"

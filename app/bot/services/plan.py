@@ -17,7 +17,7 @@ class PlanService:
             raise FileNotFoundError(f"File '{file_path}' does not exist.")
 
         try:
-            with open(file_path, "r") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 self.data = json.load(f)
             logger.info(f"Loaded plans data from '{file_path}'.")
         except json.JSONDecodeError:

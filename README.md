@@ -105,6 +105,9 @@ Administrators do not have access to server management.
 
 ## 🛠️ Installation guide
 
+For the maintained fork's Python baseline, locked local installation and offline
+runtime verification, see [Local runtime instructions](docs/runtime.md).
+
 ### Dependencies
 
 Before starting the installation, make sure you have the installed [**Docker**](https://www.docker.com/)

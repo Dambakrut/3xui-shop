@@ -25,6 +25,10 @@ class Database:
 
     async def initialize(self) -> Self:
         try:
+            if self.engine.url.get_backend_name() == "sqlite":
+                from pathlib import Path
+
+                Path(self.engine.url.database).parent.mkdir(parents=True, exist_ok=True)
             async with self.engine.begin() as connection:
                 await connection.run_sync(models.Base.metadata.create_all)
             logger.debug("Database schema initialized successfully.")

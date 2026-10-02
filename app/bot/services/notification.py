@@ -15,8 +15,6 @@ from aiogram.utils.i18n import gettext as _
 from aiogram.utils.i18n import lazy_gettext as __
 
 from app.bot.models.subscription_data import SubscriptionData
-from app.bot.routers.misc.keyboard import close_notification_keyboard
-from app.bot.routers.subscription.keyboard import payment_success_keyboard
 from app.bot.utils.constants import MESSAGE_EFFECT_IDS
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.config import Config
@@ -56,6 +54,8 @@ class NotificationService:
         chat_id = message.chat.id if message else chat_id
 
         if duration == 0 and reply_markup is None:
+            from app.bot.routers.misc.keyboard import close_notification_keyboard
+
             reply_markup = close_notification_keyboard()
 
         send_method = bot.send_document if document else bot.send_message
@@ -166,6 +166,8 @@ class NotificationService:
         key: str,
         message_effect_id: str = MESSAGE_EFFECT_IDS["🎉"],
     ) -> None:
+        from app.bot.routers.subscription.keyboard import payment_success_keyboard
+
         await self.notify_by_id(
             chat_id=user_id,
             text=__("payment:message:purchase_success").format(key=key),

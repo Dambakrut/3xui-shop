@@ -4,3 +4,8 @@
 .env
 __pycache__
 *.pyc
+.git
+.venv
+.venv-runtime-*
+.runtime-python
+.runtime-cache

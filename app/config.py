@@ -4,6 +4,7 @@ import re
 from ipaddress import ip_network
 from logging.handlers import MemoryHandler
 from pathlib import Path
+from urllib.parse import quote
 
 from environs import Env
 from marshmallow.validate import OneOf, Range
@@ -134,10 +135,12 @@ class DatabaseConfig:
     NAME: str
     USERNAME: str | None
     PASSWORD: str | None
+    DATA_DIR: Path = DEFAULT_DATA_DIR
 
     def url(self, driver: str = "sqlite+aiosqlite") -> str:
         if driver.startswith("sqlite"):
-            return f"{driver}:////{DEFAULT_DATA_DIR}/{self.NAME}.{DB_FORMAT}"
+            db_path = (self.DATA_DIR / f"{self.NAME}.{DB_FORMAT}").resolve().as_posix()
+            return f"{driver}:///{db_path}"
         return f"{driver}://{self.USERNAME}:{self.PASSWORD}@{self.HOST}:{self.PORT}/{self.NAME}"
 
 
@@ -150,8 +153,10 @@ class RedisConfig:
     PASSWORD: str | None
 
     def url(self) -> str:
-        if self.USERNAME and self.PASSWORD:
-            return f"redis://{self.USERNAME}:{self.PASSWORD}@{self.HOST}:{self.PORT}/{self.DB_NAME}"
+        if self.PASSWORD:
+            username = quote(self.USERNAME or "", safe="")
+            password = quote(self.PASSWORD, safe="")
+            return f"redis://{username}:{password}@{self.HOST}:{self.PORT}/{self.DB_NAME}"
         return f"redis://{self.HOST}:{self.PORT}/{self.DB_NAME}"
 
 
@@ -193,9 +198,22 @@ def validate_webhook_secret(secret: str | None) -> str:
     return secret
 
 
+def required_payment_credential(env: Env, name: str) -> str:
+    value = env.str(name)
+    if not value.strip():
+        raise ValueError(f"{name} must be a non-empty string when its gateway is enabled")
+    return value
+
+
 def load_config() -> Config:
     env = Env()
     env.read_env()
+
+    # Disabled gateways must not parse or require their credentials.
+    cryptomus_api_key = cryptomus_merchant_id = None
+    heleket_api_key = heleket_merchant_id = None
+    yookassa_token = yookassa_shop_id = None
+    yoomoney_notification_secret = yoomoney_wallet_id = None
 
     inbound_id = parse_xui_inbound_id(env.str("XUI_INBOUND_ID", default=None))
     webhook_secret = validate_webhook_secret(env.str("BOT_WEBHOOK_SECRET", default=None))
@@ -223,52 +241,32 @@ def load_config() -> Config:
         default=DEFAULT_SHOP_PAYMENT_CRYPTOMUS_ENABLED,
     )
     if payment_cryptomus_enabled:
-        cryptomus_api_key = env.str("CRYPTOMUS_API_KEY", default=None)
-        cryptomus_merchant_id = env.str("CRYPTOMUS_MERCHANT_ID", default=None)
-        if not cryptomus_api_key or not cryptomus_merchant_id:
-            logger.error(
-                "CRYPTOMUS_API_KEY or CRYPTOMUS_MERCHANT_ID is not set. Payment Cryptomus is disabled."
-            )
-            payment_cryptomus_enabled = False
+        cryptomus_api_key = required_payment_credential(env, "CRYPTOMUS_API_KEY")
+        cryptomus_merchant_id = required_payment_credential(env, "CRYPTOMUS_MERCHANT_ID")
 
     payment_heleket_enabled = env.bool(
         "SHOP_PAYMENT_HELEKET_ENABLED",
         default=DEFAULT_SHOP_PAYMENT_HELEKET_ENABLED,
     )
     if payment_heleket_enabled:
-        heleket_api_key = env.str("HELEKET_API_KEY", default=None)
-        heleket_merchant_id = env.str("HELEKET_MERCHANT_ID", default=None)
-        if not heleket_api_key or not heleket_merchant_id:
-            logger.error(
-                "HELEKET_API_KEY or HELEKET_MERCHANT_ID is not set. Payment Heleket is disabled."
-            )
-            payment_heleket_enabled = False
+        heleket_api_key = required_payment_credential(env, "HELEKET_API_KEY")
+        heleket_merchant_id = required_payment_credential(env, "HELEKET_MERCHANT_ID")
 
     payment_yookassa_enabled = env.bool(
         "SHOP_PAYMENT_YOOKASSA_ENABLED",
         default=DEFAULT_SHOP_PAYMENT_YOOKASSA_ENABLED,
     )
     if payment_yookassa_enabled:
-        yookassa_token = env.str("YOOKASSA_TOKEN", default=None)
-        yookassa_shop_id = env.int("YOOKASSA_SHOP_ID", default=None)
-        if not yookassa_token or not yookassa_shop_id:
-            logger.error(
-                "YOOKASSA_TOKEN or YOOKASSA_SHOP_ID is not set. Payment YooKassa is disabled."
-            )
-            payment_yookassa_enabled = False
+        yookassa_token = required_payment_credential(env, "YOOKASSA_TOKEN")
+        yookassa_shop_id = env.int("YOOKASSA_SHOP_ID", validate=Range(min=1))
 
     payment_yoomoney_enabled = env.bool(
         "SHOP_PAYMENT_YOOMONEY_ENABLED",
         default=DEFAULT_SHOP_PAYMENT_YOOMONEY_ENABLED,
     )
     if payment_yoomoney_enabled:
-        yoomoney_notification_secret = env.str("YOOMONEY_NOTIFICATION_SECRET", default=None)
-        yoomoney_wallet_id = env.str("YOOMONEY_WALLET_ID", default=None)
-        if not yoomoney_notification_secret or not yoomoney_wallet_id:
-            logger.error(
-                "YOOMONEY_NOTIFICATION_SECRET or YOOMONEY_WALLET_ID is not set. Payment YooMoney is disabled."
-            )
-            payment_yoomoney_enabled = False
+        yoomoney_notification_secret = required_payment_credential(env, "YOOMONEY_NOTIFICATION_SECRET")
+        yoomoney_wallet_id = required_payment_credential(env, "YOOMONEY_WALLET_ID")
 
     if (
         not payment_stars_enabled
@@ -380,22 +378,23 @@ def load_config() -> Config:
             ),
         ),
         cryptomus=CryptomusConfig(
-            API_KEY=env.str("CRYPTOMUS_API_KEY", default=None),
-            MERCHANT_ID=env.str("CRYPTOMUS_MERCHANT_ID", default=None),
+            API_KEY=cryptomus_api_key,
+            MERCHANT_ID=cryptomus_merchant_id,
         ),
         heleket=HeleketConfig(
-            API_KEY=env.str("HELEKET_API_KEY", default=None),
-            MERCHANT_ID=env.str("HELEKET_MERCHANT_ID", default=None),
+            API_KEY=heleket_api_key,
+            MERCHANT_ID=heleket_merchant_id,
         ),
         yookassa=YooKassaConfig(
-            TOKEN=env.str("YOOKASSA_TOKEN", default=None),
-            SHOP_ID=env.int("YOOKASSA_SHOP_ID", default=None),
+            TOKEN=yookassa_token,
+            SHOP_ID=yookassa_shop_id,
         ),
         yoomoney=YooMoneyConfig(
-            NOTIFICATION_SECRET=env.str("YOOMONEY_NOTIFICATION_SECRET", default=None),
-            WALLET_ID=env.str("YOOMONEY_WALLET_ID", default=None),
+            NOTIFICATION_SECRET=yoomoney_notification_secret,
+            WALLET_ID=yoomoney_wallet_id,
         ),
         database=DatabaseConfig(
+            DATA_DIR=Path(env.str("DB_DATA_DIR", default=str(DEFAULT_DATA_DIR))),
             HOST=env.str("DB_HOST", default=None),
             PORT=env.int("DB_PORT", default=None),
             USERNAME=env.str("DB_USERNAME", default=None),

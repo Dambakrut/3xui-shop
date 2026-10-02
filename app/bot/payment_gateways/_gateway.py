@@ -12,7 +12,6 @@ from aiohttp.web import Application
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ServicesContainer, SubscriptionData
-from app.bot.routers.main_menu.handler import redirect_to_main_menu
 from app.bot.utils.constants import (
     DEFAULT_LANGUAGE,
     EVENT_PAYMENT_CANCELED_TAG,
@@ -38,6 +37,13 @@ def _payment_lock(payment_id: str) -> asyncio.Lock:
 
 from app.bot.models import SubscriptionData
 from app.bot.utils.constants import Currency
+
+
+async def redirect_to_main_menu(*args, **kwargs):
+    # Routers depend on gateways; import only when handling a fully initialized app.
+    from app.bot.routers.main_menu.handler import redirect_to_main_menu as redirect
+
+    return await redirect(*args, **kwargs)
 
 
 class PaymentGateway(ABC):
