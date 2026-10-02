@@ -1,7 +1,6 @@
 import logging
 from dataclasses import dataclass
 
-from py3xui import AsyncApi
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import Config
@@ -22,7 +21,6 @@ logger = logging.getLogger(__name__)
 class Connection:
     server: Server
     adapter: XUIAdapter
-    api: AsyncApi | None  # Legacy write client; never used for modern reads.
 
 
 class ServerPoolService:
@@ -55,19 +53,8 @@ class ServerPoolService:
                 else:
                     server.online = await self.validate_configured_inbound(adapter) is not None
                 if server.online:
-                    # py3xui stays for legacy writes. It is not logged in at startup:
-                    # v0.3.2 login is incompatible with 3x-ui 3.8.5 CSRF.
-                    api = (
-                        AsyncApi(
-                            host=server.host,
-                            username=self.config.xui.USERNAME,
-                            password=self.config.xui.PASSWORD,
-                            token=self.config.xui.TOKEN,
-                        )
-                        if mode is XUIAuthMode.SESSION else None
-                    )
-                    self._servers[server.id] = Connection(server=server, adapter=adapter, api=api)
-                    logger.info("Server %s available for read operations", server.id)
+                    self._servers[server.id] = Connection(server=server, adapter=adapter)
+                    logger.info("Server %s available for panel operations", server.id)
             except Exception as exception:
                 server.online = False
                 logger.error("Server %s unavailable for reads (%s)", server.id, type(exception).__name__)

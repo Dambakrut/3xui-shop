@@ -6,12 +6,11 @@ if TYPE_CHECKING:
     from .server_pool import ServerPoolService
 
 import logging
+from urllib.parse import quote
 
-from py3xui import Client
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ClientData
-from app.bot.utils.network import extract_base_url
 from app.bot.utils.time import (
     add_days_to_timestamp,
     days_to_timestamp,
@@ -19,7 +18,10 @@ from app.bot.utils.time import (
 )
 from app.config import Config
 from app.db.models import Promocode, User
-from app.integrations.xui import XUIClient, XUIError, XUINotFoundError, validate_client_membership
+from app.integrations.xui import (
+    XUIAdapter, XUIAmbiguousWriteError, XUIClient, XUIClientWrite, XUIError,
+    XUINotFoundError, validate_client_membership,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,14 +144,33 @@ class VPNService:
             logger.debug(f"Server ID for user {user.tg_id} not found.")
             return None
 
-        subscription = extract_base_url(
-            url=user.server.host,
-            port=self.config.xui.SUBSCRIPTION_PORT,
-            path=self.config.xui.SUBSCRIPTION_PATH,
-        )
-        key = f"{subscription}{user.vpn_id}"
-        logger.debug(f"Fetched key for {user.tg_id}: {key}.")
+        connection = await self.server_pool_service.get_connection(user)
+        if connection is None:
+            return None
+        client = await self._read_owned_client(user, connection)
+        if client is None:
+            return None
+        if not client.sub_id or any(c.isspace() or ord(c) < 32 or c in "/\\" for c in client.sub_id):
+            raise VPNReadError("Invalid canonical subscription identifier")
+        subscription = self.config.xui.SUBSCRIPTION_BASE_URL
+        if not subscription:
+            subscription = await connection.adapter.get_subscription_base_url()
+        subscription = XUIAdapter.validate_subscription_base_url(subscription)
+        key = f"{subscription.rstrip('/')}/{quote(client.sub_id, safe='')}"
+        logger.debug("Subscription URL retrieved for user %s", user.tg_id)
         return key
+
+    @staticmethod
+    def _creation_flow(inbound, requested_flow: str) -> str:
+        # Existing shop creates UUID-based VLESS clients with Vision. Other
+        # protocols need their own credential and flow policy.
+        settings = inbound.stream_settings or {}
+        if (inbound.protocol != "vless" or inbound.raw.get("disableFlow") is True
+                or settings.get("security") not in ("tls", "reality")
+                or settings.get("network") != "tcp"
+                or requested_flow != "xtls-rprx-vision"):
+            raise VPNReadError("Configured inbound is not compatible with shop VLESS Vision provisioning")
+        return requested_flow
 
     async def create_client(
         self,
@@ -171,34 +192,31 @@ class VPNService:
         if not connection:
             return False
 
-        if not await self.server_pool_service.validate_configured_inbound(connection.adapter):
+        inbound = await self.server_pool_service.validate_configured_inbound(connection.adapter)
+        if inbound is None:
             return False
-
-        if connection.api is None:
-            logger.error("Legacy 3x-ui write client is unavailable")
+        if duration <= 0 or devices < 0 or total_gb < 0:
             return False
-
-        new_client = Client(
-            email=str(user.tg_id),
-            enable=enable,
-            id=user.vpn_id,
-            expiry_time=days_to_timestamp(duration),
-            flow=flow,
-            limit_ip=devices,
-            sub_id=user.vpn_id,
-            total_gb=total_gb,
-        )
         try:
-            await connection.api.client.add(
-                inbound_id=self.config.xui.INBOUND_ID, clients=[new_client]
+            write = XUIClientWrite(
+                email=str(user.tg_id), uuid=user.vpn_id,
+                inbound_ids=(self.config.xui.INBOUND_ID,),
+                expiry_time_ms=days_to_timestamp(duration), total_bytes=total_gb,
+                limit_ip=devices, limit_hwid=0, tg_id=user.tg_id,
+                sub_id=user.vpn_id, enable=enable,
+                flow=self._creation_flow(inbound, flow),
             )
+            result = await connection.adapter.add_client(write)
             if not user.server_id and not await self.server_pool_service.assign_server_to_user(
                 user, connection.server
             ):
-                logger.critical(f"Client {user.tg_id} was created but server assignment failed.")
-                return False
+                raise XUIAmbiguousWriteError("Panel client persisted but server assignment failed")
+            if result.node_pending is not False:
+                raise XUIAmbiguousWriteError("Client persisted; node activation needs review")
             logger.info(f"Successfully created client for {user.tg_id}")
             return True
+        except XUIAmbiguousWriteError:
+            raise
         except Exception as exception:
             logger.error("Error creating client for %s (%s)", user.tg_id, type(exception).__name__)
             return False
@@ -228,53 +246,44 @@ class VPNService:
             current_device_limit = await self.get_limit_ip(user=user, client=canonical)
             if current_device_limit is None:
                 return False
-            if connection.api is None:
-                logger.error("Legacy 3x-ui write client is unavailable")
+            if duration <= 0 or devices < 0 or total_gb != 0 or flow != "xtls-rprx-vision":
                 return False
-
-            # Legacy py3xui read remains solely to hydrate its write model.
-            # v0.3.2 cannot update a 3x-ui 3.8.5 client; modern write is deferred.
-            client = await connection.api.client.get_by_email(str(user.tg_id))
-
-            if client is None:
-                logger.critical(f"Client {user.tg_id} not found for update.")
-                return False
-
-            if client.inbound_id != self.config.xui.INBOUND_ID:
-                logger.error("Legacy client inbound mismatch for %s; update refused", user.tg_id)
-                return False
+            # An update changes the shared client record. All attached
+            # inbounds must be VLESS; mixed credentials need manual handling.
+            for inbound_id in canonical.inbound_ids:
+                inbound = await connection.adapter.get_inbound(inbound_id)
+                if not inbound.enable or inbound.protocol != "vless":
+                    raise VPNReadError("Client has an unsupported inbound attachment")
 
             if not replace_devices:
                 devices = current_device_limit + devices
 
             current_time = get_current_timestamp()
-
+            if canonical.expiry_time_ms <= 0:
+                raise VPNReadError("Unlimited or delayed-start expiry requires manual review")
             if not replace_duration:
-                expiry_time_to_use = max(client.expiry_time, current_time)
+                expiry_time_to_use = max(canonical.expiry_time_ms, current_time)
             else:
                 expiry_time_to_use = current_time
 
             expiry_time = add_days_to_timestamp(timestamp=expiry_time_to_use, days=duration)
-
-            client.enable = enable
-            client.id = user.vpn_id
-            client.expiry_time = expiry_time
-            client.flow = flow
-            client.limit_ip = devices
-            client.sub_id = user.vpn_id
-            client.total_gb = total_gb
-
-            await connection.api.client.update(client_uuid=client.id, client=client)
+            write = XUIClientWrite.from_client(
+                canonical, expiry_time_ms=expiry_time,
+                limit_ip=devices, enable=enable,
+            )
+            result = await connection.adapter.update_client(canonical, write)
+            if result.node_pending is not False:
+                raise XUIAmbiguousWriteError("Client persisted; node activation needs review")
             logger.info(f"Client {user.tg_id} updated successfully.")
             return True
+        except XUIAmbiguousWriteError:
+            raise
         except Exception as exception:
             logger.error("Error updating client %s (%s)", user.tg_id, type(exception).__name__)
             return False
 
     async def create_subscription(self, user: User, devices: int, duration: int) -> bool:
-        if not await self.is_client_exists(user):
-            return await self.create_client(user=user, devices=devices, duration=duration)
-        return False
+        return await self.create_client(user=user, devices=devices, duration=duration)
 
     async def extend_subscription(self, user: User, devices: int, duration: int) -> bool:
         return await self.update_client(

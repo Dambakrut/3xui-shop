@@ -98,6 +98,16 @@ class XUIReadConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "XUI_AUTH_MODE"):
             self.load({"XUI_AUTH_MODE": "legacy"})
 
+    def test_explicit_subscription_base_validation(self):
+        self.assertEqual(
+            self.load({"XUI_SUBSCRIPTION_BASE_URL": "https://sub.example/custom/path/"})
+            .xui.SUBSCRIPTION_BASE_URL, "https://sub.example/custom/path/",
+        )
+        for uri in ("http://sub.example/custom/", "https://sub.example/custom",
+                    "https://user:pass@sub.example/custom/", "https://sub.example/custom/?q=1"):
+            with self.subTest(uri=uri), self.assertRaisesRegex(ValueError, "XUI_SUBSCRIPTION_BASE_URL"):
+                self.load({"XUI_SUBSCRIPTION_BASE_URL": uri})
+
 
 @unittest.skipUnless(AVAILABLE, "Requires the locked runtime dependencies")
 class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
@@ -133,9 +143,7 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
         from app.bot.services import server_pool as module
         from app.db.models import Server
 
-        legacy = SimpleNamespace(login=AsyncMock(), client=SimpleNamespace(add=AsyncMock()))
         with patch.object(module, "XUIAdapter", return_value=self.adapter) as make_adapter, \
-             patch.object(module, "AsyncApi", return_value=legacy) as make_legacy, \
              patch.object(Server, "get_all", new=AsyncMock(return_value=[self.server])), \
              patch.object(Server, "update", new=AsyncMock()):
             await self.pool.sync_servers()
@@ -148,9 +156,7 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
                 self.server.host, auth_mode=module.XUIAuthMode.SESSION,
                 username="dummy", password="dummy", token=None,
             )
-            make_legacy.assert_called_once()
-            legacy.login.assert_not_awaited()
-            legacy.client.add.assert_not_awaited()
+            self.assertFalse(hasattr(self.pool._servers[7], "api"))
             await self.pool.close()
             self.adapter.close.assert_awaited_once()
 
@@ -168,12 +174,10 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(items=items):
                 adapter = self.fake_adapter(inbounds=items)
                 with patch.object(module, "XUIAdapter", return_value=adapter), \
-                     patch.object(module, "AsyncApi") as legacy, \
                      patch.object(Server, "update", new=AsyncMock()):
                     await self.pool._add_server(self.server)
                 self.assertFalse(self.server.online)
                 self.assertEqual(self.pool._servers, {})
-                legacy.assert_not_called()
                 adapter.close.assert_awaited_once()
 
     async def test_auth_status_version_and_xray_failures_unavailable(self):
@@ -195,7 +199,7 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.pool._servers, {})
                 adapter.close.assert_awaited_once()
 
-    async def test_token_mode_uses_separate_token_without_legacy_client(self):
+    async def test_token_mode_uses_separate_token(self):
         from app.bot.services import server_pool as module
         from app.db.models import Server
 
@@ -203,13 +207,11 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
         self.config.xui.API_TOKEN = "new-api-token"
         self.config.xui.USERNAME = self.config.xui.PASSWORD = None
         with patch.object(module, "XUIAdapter", return_value=self.adapter) as make_adapter, \
-             patch.object(module, "AsyncApi") as legacy, \
              patch.object(Server, "update", new=AsyncMock()):
             await self.pool._add_server(self.server)
-            self.assertIsNone(self.pool._servers[7].api)
+            self.assertFalse(hasattr(self.pool._servers[7], "api"))
             self.assertEqual(make_adapter.call_args.kwargs["token"], "new-api-token")
             self.assertIsNone(make_adapter.call_args.kwargs["username"])
-            legacy.assert_not_called()
             await self.pool.close()
 
     async def test_refresh_closes_old_adapter_and_replaces_connection(self):
@@ -218,7 +220,6 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
 
         replacement = self.fake_adapter()
         with patch.object(module, "XUIAdapter", side_effect=[self.adapter, replacement]), \
-             patch.object(module, "AsyncApi", return_value=SimpleNamespace(login=AsyncMock())), \
              patch.object(Server, "update", new=AsyncMock()):
             await self.pool._add_server(self.server)
             await self.pool.refresh_server(self.server)
@@ -230,7 +231,7 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_removes_missing_server_and_closes_adapter(self):
         from app.db.models import Server
 
-        self.pool._servers[7] = SimpleNamespace(server=self.server, adapter=self.adapter, api=None)
+        self.pool._servers[7] = SimpleNamespace(server=self.server, adapter=self.adapter)
         with patch.object(Server, "get_all", new=AsyncMock(return_value=[])):
             await self.pool.sync_servers()
         self.assertEqual(self.pool._servers, {})
@@ -253,9 +254,7 @@ class VPNReadTests(unittest.IsolatedAsyncioTestCase):
             client=SimpleNamespace(get_by_email=AsyncMock(), add=AsyncMock(), update=AsyncMock()),
             inbound=SimpleNamespace(get_list=AsyncMock()),
         )
-        self.connection = SimpleNamespace(
-            server=SimpleNamespace(name="local"), adapter=self.adapter, api=self.legacy,
-        )
+        self.connection = SimpleNamespace(server=SimpleNamespace(name="local"), adapter=self.adapter)
         self.pool = SimpleNamespace(get_connection=AsyncMock(return_value=self.connection))
         self.service = VPNService(SimpleNamespace(xui=SimpleNamespace(INBOUND_ID=42)), FakeSession, self.pool)
         self.user = SimpleNamespace(tg_id=123, vpn_id=UUID, server_id=7)
@@ -314,11 +313,12 @@ class VPNReadTests(unittest.IsolatedAsyncioTestCase):
             await self.service.is_client_exists(self.user)
         self.assert_no_legacy_reads_or_writes()
 
-    async def test_token_mode_unavailable_legacy_write_stays_fail_closed(self):
+    async def test_update_without_supported_inbounds_stays_fail_closed(self):
         from app.integrations.xui import XUIInboundSummary
 
-        self.connection.api = None
-        self.pool.validate_configured_inbound = AsyncMock(return_value=XUIInboundSummary(
-            42, "vless", True, "Shop", "in-42", {}, {}))
+        self.adapter.get_inbound = AsyncMock(return_value=XUIInboundSummary(
+            42, "trojan", True, "Shop", "in-42", {}, {}))
+        self.adapter.update_client = AsyncMock()
         self.assertFalse(await self.service.update_client(self.user, 2, 30))
+        self.adapter.update_client.assert_not_awaited()
         self.assert_no_legacy_reads_or_writes()

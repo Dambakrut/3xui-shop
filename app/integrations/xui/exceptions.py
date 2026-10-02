@@ -1,4 +1,4 @@
-"""Errors exposed by the read-only 3x-ui adapter.
+"""Errors exposed by the 3x-ui adapter.
 
 Messages deliberately exclude URLs, provider messages and response bodies.
 """
@@ -30,3 +30,11 @@ class XUIProtocolError(XUIError):
 
 class XUIAPIError(XUIError):
     """The panel returned a valid negative API response."""
+
+
+class XUIAmbiguousWriteError(XUIError):
+    """A mutation may have happened; never replay it without reconciliation."""
+
+
+class XUIReconciliationError(XUIAmbiguousWriteError):
+    """A post-write read could not confirm the intended persisted state."""

@@ -1,7 +1,4 @@
-"""Read-only HTTP adapter for MHSanaei/3x-ui v3.8.5.
-
-This module is intentionally not wired into the shop's provisioning path.
-"""
+"""Async HTTP adapter for MHSanaei/3x-ui v3.8.5."""
 
 from __future__ import annotations
 
@@ -13,19 +10,23 @@ import aiohttp
 
 from .exceptions import (
     XUIAPIError,
+    XUIAmbiguousWriteError,
     XUIAuthenticationError,
     XUIAuthorizationError,
     XUIError,
     XUINotFoundError,
     XUIProtocolError,
+    XUIReconciliationError,
     XUITransportError,
 )
 from .models import (
     XUIAuthMode,
     XUIClient,
     XUIClientTraffic,
+    XUIClientWrite,
     XUIInboundSummary,
     XUIServerStatus,
+    XUIWriteResult,
 )
 
 
@@ -78,7 +79,7 @@ class XUIAdapter:
 
     @property
     def csrf_token(self) -> str | None:
-        """Session CSRF token retained for a later write-capable adapter patch."""
+        """Session CSRF token used for authenticated POST requests."""
         return self._csrf_token
 
     async def __aenter__(self) -> XUIAdapter:
@@ -118,12 +119,13 @@ class XUIAdapter:
     async def _request(
         self, method: str, endpoint: str, *, json_body: dict[str, Any] | None = None,
         login: bool = False, csrf_bootstrap: bool = False, not_found_on_gorm: bool = False,
+        mutation: bool = False,
     ) -> Any:
         session = self._get_session()
         headers = {"Accept": "application/json"}
         if self.auth_mode is XUIAuthMode.TOKEN:
             headers["Authorization"] = f"Bearer {self._token}"
-        elif login:
+        elif login or mutation:
             if not self._csrf_token:
                 raise XUIAuthenticationError("CSRF token is unavailable")
             headers["X-CSRF-Token"] = self._csrf_token
@@ -260,3 +262,124 @@ class XUIAdapter:
         if not isinstance(value, list) or any(not isinstance(link, str) or not link for link in value):
             raise XUIProtocolError("Invalid subscription links response")
         return tuple(value)
+
+    async def get_subscription_base_url(self) -> str:
+        """Read the panel's explicit subURI; never infer a reverse proxy URL."""
+        if not self._authenticated:
+            await self.authenticate()
+        # v3.8.5 names this read-only settings route POST /setting/all.
+        value = await self._request("POST", "panel/api/setting/all", json_body={}, mutation=True)
+        if not isinstance(value, dict):
+            raise XUIProtocolError("Invalid panel settings response")
+        uri = value.get("subURI")
+        if not isinstance(uri, str) or not uri:
+            raise XUIProtocolError("Panel subURI is not explicitly configured")
+        return self.validate_subscription_base_url(uri)
+
+    @staticmethod
+    def validate_subscription_base_url(uri: str) -> str:
+        try:
+            parts = urlsplit(uri)
+            parts.port
+        except ValueError as exc:
+            raise XUIProtocolError("Invalid subscription base URL") from exc
+        if (any(c.isspace() or ord(c) < 32 for c in uri)
+                or "\\" in uri or parts.scheme != "https" or not parts.hostname or parts.username
+                or parts.password or parts.query or parts.fragment or not parts.path
+                or not parts.path.endswith("/")):
+            raise XUIProtocolError("Subscription base URL must be an HTTPS URL ending in /")
+        return uri
+
+    @staticmethod
+    def _matches(client: XUIClient, desired: XUIClientWrite) -> bool:
+        return (
+            client.email == desired.email and client.uuid == desired.uuid
+            and set(client.inbound_ids) == set(desired.inbound_ids)
+            and client.expiry_time_ms == desired.expiry_time_ms
+            and client.total_bytes == desired.total_bytes
+            and client.limit_ip == desired.limit_ip
+            and client.limit_hwid == desired.limit_hwid
+            and client.tg_id == desired.tg_id
+            and client.sub_id == desired.sub_id
+            and client.enable is desired.enable
+            and client.flow == desired.flow and client.comment == desired.comment
+            and client.reset == desired.reset
+            and all(XUIClientWrite.from_client(
+                client, expiry_time_ms=desired.expiry_time_ms,
+                limit_ip=client.limit_ip, enable=client.enable,
+            ).preserved.get(key) == value for key, value in desired.preserved.items())
+        )
+
+    async def _read_after_write(self, desired: XUIClientWrite) -> XUIClient:
+        try:
+            client = await self.get_client(desired.email)
+        except XUIError as exc:
+            raise XUIReconciliationError("Client write outcome needs review") from exc
+        if not self._matches(client, desired):
+            raise XUIReconciliationError("Client write was not confirmed")
+        return client
+
+    async def _mutate(self, endpoint: str, body: dict[str, Any],
+                      desired: XUIClientWrite) -> XUIWriteResult:
+        if not self._authenticated:
+            await self.authenticate()
+        try:
+            obj = await self._request("POST", endpoint, json_body=body, mutation=True)
+        except XUIError as exc:
+            # A failed response, malformed envelope, timeout or connection reset
+            # can all follow a partial commit in v3.8.5. Never replay POST.
+            try:
+                client = await self._read_after_write(desired)
+            except XUIReconciliationError as review:
+                raise review from exc
+            return XUIWriteResult(
+                client=client,
+                node_pending=None, reconciled=True,
+            )
+        if obj is None:
+            # Canonical persistence cannot establish node activation without
+            # an explicit nodePending field in the mutation response.
+            node_pending = None
+        elif isinstance(obj, dict) and type(obj.get("nodePending")) is bool:
+            node_pending = obj["nodePending"]
+        else:
+            # The envelope was successful but its outcome object is unknown.
+            await self._read_after_write(desired)
+            raise XUIReconciliationError("Unknown client write response")
+        client = await self._read_after_write(desired)
+        return XUIWriteResult(client=client, node_pending=node_pending, reconciled=True)
+
+    async def add_client(self, desired: XUIClientWrite) -> XUIWriteResult:
+        """Create one explicit membership, with pre-read and post-read guards."""
+        if len(desired.inbound_ids) != 1:
+            raise ValueError("Shop create requires exactly one configured inbound")
+        try:
+            existing = await self.get_client(desired.email)
+        except XUINotFoundError:
+            existing = None
+        if existing is not None:
+            if not self._matches(existing, desired):
+                raise XUIAmbiguousWriteError("Existing client differs from requested create")
+            return XUIWriteResult(client=existing, node_pending=None, reconciled=True)
+        return await self._mutate(
+            "panel/api/clients/add",
+            {"client": desired.client_payload(), "inboundIds": list(desired.inbound_ids)},
+            desired,
+        )
+
+    async def update_client(self, current: XUIClient,
+                            desired: XUIClientWrite) -> XUIWriteResult:
+        """Full replacement body, preserving known fields and all memberships."""
+        if (current.email != desired.email or current.uuid != desired.uuid
+                or set(current.inbound_ids) != set(desired.inbound_ids)):
+            raise XUIAmbiguousWriteError("Client identity or membership changed")
+        latest = await self.get_client(current.email)
+        if self._matches(latest, desired):
+            return XUIWriteResult(client=latest, node_pending=None, reconciled=True)
+        if (latest.uuid != current.uuid or set(latest.inbound_ids) != set(current.inbound_ids)
+                or latest.raw != current.raw):
+            raise XUIAmbiguousWriteError("Client changed since preservation snapshot")
+        return await self._mutate(
+            f"panel/api/clients/update/{self._segment(desired.email, 'email')}",
+            desired.client_payload(), desired,
+        )

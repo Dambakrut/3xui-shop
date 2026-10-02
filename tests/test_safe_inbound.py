@@ -52,11 +52,6 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
             USERNAME="test", PASSWORD="test", TOKEN=None, INBOUND_ID=42,
             AUTH_MODE="session", API_TOKEN=None,
         ))
-        self.api = SimpleNamespace(
-            login=AsyncMock(),
-            inbound=SimpleNamespace(get_list=AsyncMock()),
-            client=SimpleNamespace(add=AsyncMock(), get_by_email=AsyncMock(), update=AsyncMock()),
-        )
         self.server = SimpleNamespace(
             id=7, name="test", host="https://panel.test", online=False,
             current_clients=1, max_clients=10,
@@ -66,6 +61,7 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
         self.user_model = SimpleNamespace(update=AsyncMock(return_value=self.user))
         self.inbound = lambda inbound_id, enabled=True: SimpleNamespace(
             id=inbound_id, enable=enabled, protocol="vless", remark="Shop",
+            stream_settings={"security": "reality", "network": "tcp"}, raw={},
         )
         self.adapter = SimpleNamespace(
             authenticate=AsyncMock(),
@@ -74,11 +70,13 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
             get_client=AsyncMock(return_value=SimpleNamespace(
                 uuid="shop-uuid", email="123", inbound_ids=(42,), limit_ip=2,
             )),
+            add_client=AsyncMock(return_value=SimpleNamespace(node_pending=False)),
+            update_client=AsyncMock(return_value=SimpleNamespace(node_pending=False)),
             close=AsyncMock(),
         )
         pool_ns = dict(
             dataclass=dataclass, logging=logging, logger=logging.getLogger("safe-inbound-test"),
-            AsyncApi=Mock(return_value=self.api), Server=self.server_model, User=self.user_model,
+            Server=self.server_model, User=self.user_model,
             XUIAdapter=Mock(return_value=self.adapter), XUIAuthMode=FakeAuthMode,
             TARGET_PANEL_VERSION="3.8.5", KNOWN_PROTOCOLS=frozenset({"vless"}),
         )
@@ -90,7 +88,6 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.authenticate.assert_awaited_once()
         self.adapter.get_server_status.assert_awaited_once()
         self.adapter.list_inbounds.assert_awaited_once()
-        self.api.login.assert_not_awaited()
         self.assertTrue(self.server.online)
         self.assertIn(7, self.pool._servers)
 
@@ -103,17 +100,17 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
         self.pool.sync_servers = AsyncMock()
         vpn = self.make_vpn()
         self.assertFalse(await vpn.create_client(self.user, devices=2, duration=30))
-        self.api.client.add.assert_not_awaited()
+        self.adapter.add_client.assert_not_awaited()
         self.user_model.update.assert_not_awaited()
 
     async def test_multiple_inbounds_use_exact_configured_id(self):
         self.adapter.list_inbounds.return_value = [self.inbound(99), self.inbound(42), self.inbound(1)]
         self.assertEqual((await self.pool.validate_configured_inbound(self.adapter)).id, 42)
-        self.pool._servers[7] = SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter)
+        self.pool._servers[7] = SimpleNamespace(server=self.server, adapter=self.adapter)
         self.pool.sync_servers = AsyncMock()
         vpn = self.make_vpn()
         self.assertTrue(await vpn.create_client(self.user, devices=2, duration=30))
-        self.assertEqual(self.api.client.add.await_args.kwargs["inbound_id"], 42)
+        self.assertEqual(self.adapter.add_client.await_args.args[0].inbound_ids, (42,))
         self.user_model.update.assert_awaited_once()
 
     async def test_two_valid_servers_use_existing_selection_and_assign_after_add(self):
@@ -121,27 +118,28 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
             id=8, name="other", host="https://other.test", online=True,
             current_clients=0, max_clients=10,
         )
-        other_api = SimpleNamespace(
-            client=SimpleNamespace(add=AsyncMock()),
+        other_adapter = SimpleNamespace(
+            list_inbounds=AsyncMock(return_value=[self.inbound(42)]),
+            add_client=AsyncMock(return_value=SimpleNamespace(node_pending=False)),
         )
-        other_adapter = SimpleNamespace(list_inbounds=AsyncMock(return_value=[self.inbound(42)]))
         self.pool._servers = {
-            7: SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter),
-            8: SimpleNamespace(server=other_server, api=other_api, adapter=other_adapter),
+            7: SimpleNamespace(server=self.server, adapter=self.adapter),
+            8: SimpleNamespace(server=other_server, adapter=other_adapter),
         }
         self.pool.sync_servers = AsyncMock()
         selected = await self.pool.get_available_server()
         self.assertIs(selected, other_server)
 
-        async def add_and_check_assignment(**kwargs):
+        async def add_and_check_assignment(*args, **kwargs):
             self.assertIsNone(self.user.server_id)
             self.user_model.update.assert_not_awaited()
+            return SimpleNamespace(node_pending=False)
 
-        other_api.client.add.side_effect = add_and_check_assignment
+        other_adapter.add_client.side_effect = add_and_check_assignment
         self.assertTrue(await self.make_vpn().create_client(self.user, 2, 30))
-        other_api.client.add.assert_awaited_once()
-        self.assertEqual(other_api.client.add.await_args.kwargs["inbound_id"], 42)
-        self.api.client.add.assert_not_awaited()
+        other_adapter.add_client.assert_awaited_once()
+        self.assertEqual(other_adapter.add_client.await_args.args[0].inbound_ids, (42,))
+        self.adapter.add_client.assert_not_awaited()
         self.assertEqual(self.user.server_id, other_server.id)
         self.user_model.update.assert_awaited_once()
 
@@ -160,14 +158,14 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_api_error_blocks_add(self):
         self.adapter.list_inbounds.side_effect = RuntimeError("API unavailable")
-        self.pool._servers[7] = SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter)
+        self.pool._servers[7] = SimpleNamespace(server=self.server, adapter=self.adapter)
         self.pool.sync_servers = AsyncMock()
         self.assertFalse(await self.make_vpn().create_client(self.user, 2, 30))
-        self.api.client.add.assert_not_awaited()
+        self.adapter.add_client.assert_not_awaited()
 
     async def test_client_add_error_does_not_assign_server(self):
-        self.api.client.add.side_effect = RuntimeError("add failed")
-        self.pool._servers[7] = SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter)
+        self.adapter.add_client.side_effect = RuntimeError("add failed")
+        self.pool._servers[7] = SimpleNamespace(server=self.server, adapter=self.adapter)
         self.pool.sync_servers = AsyncMock()
         self.assertFalse(await self.make_vpn().create_client(self.user, 2, 30))
         self.assertIsNone(self.user.server_id)
@@ -175,27 +173,27 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_refuses_client_outside_configured_inbound(self):
         self.user.server_id = 7
-        self.pool.get_connection = AsyncMock(return_value=SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter))
+        self.pool.get_connection = AsyncMock(return_value=SimpleNamespace(server=self.server, adapter=self.adapter))
         self.adapter.get_client.return_value = SimpleNamespace(
             uuid="shop-uuid", email="123", inbound_ids=(99,), limit_ip=2,
         )
         self.assertFalse(await self.make_vpn().update_client(self.user, 2, 30))
-        self.api.client.get_by_email.assert_not_awaited()
-        self.api.client.update.assert_not_awaited()
+        self.adapter.update_client.assert_not_awaited()
 
     async def test_update_refuses_uuid_mismatch(self):
         self.user.server_id = 7
-        self.pool.get_connection = AsyncMock(return_value=SimpleNamespace(server=self.server, api=self.api, adapter=self.adapter))
+        self.pool.get_connection = AsyncMock(return_value=SimpleNamespace(server=self.server, adapter=self.adapter))
         self.adapter.get_client.return_value = SimpleNamespace(
             uuid="other-uuid", email="123", inbound_ids=(42,), limit_ip=2,
         )
         self.assertFalse(await self.make_vpn().update_client(self.user, 2, 30))
-        self.api.client.get_by_email.assert_not_awaited()
-        self.api.client.update.assert_not_awaited()
+        self.adapter.update_client.assert_not_awaited()
 
     def make_vpn(self):
         vpn_ns = dict(
-            logger=logging.getLogger("safe-inbound-test"), Client=Mock(side_effect=lambda **kw: SimpleNamespace(**kw)),
+            logger=logging.getLogger("safe-inbound-test"),
+            XUIClientWrite=Mock(side_effect=lambda **kw: SimpleNamespace(**kw)),
+            XUIAmbiguousWriteError=self.xui_error,
             days_to_timestamp=lambda days: days * 86400000, User=self.user_model,
             XUIError=self.xui_error, XUINotFoundError=self.not_found,
             validate_client_membership=lambda client, inbound_id: (

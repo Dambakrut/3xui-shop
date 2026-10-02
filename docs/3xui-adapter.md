@@ -1,53 +1,154 @@
-# 3x-ui 3.8.5 adapter foundation (Patch 6B.1)
+# 3x-ui 3.8.5 adapter — Patch 6B.2b
 
-The `app.integrations.xui` package is a **read-only**, asynchronous HTTP client for the [MHSanaei/3x-ui v3.8.5](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5) API. Production panel version is reported as 3.8.5; Xray Core version is reported as 26.9.30. These tests use local fakes, never the production panel. Shop read paths use this adapter as of Patch 6B.2a; write paths remain legacy py3xui 0.3.2.
+Target: MHSanaei/3x-ui v3.8.5; reported production Xray Core 26.9.30.
+Source/local tests only. No production requests or live writes performed.
+
+## Runtime integration status
+
+READ PATH: MODERN XUIAdapter
+
+WRITE PATH: MODERN XUIAdapter
+
+LEGACY py3xui: NOT USED FOR PANEL RUNTIME OPERATIONS
+
+LIVE PRODUCTION WRITE: NOT TESTED
+
+ServerPoolService owns one adapter/session per server. Startup remains read-only:
+authenticate, require panel 3.8.5/running Xray, validate enabled configured inbound
+and known protocol. Failed candidates, refreshed connections and shutdown sessions
+are closed. Existing server selection is preserved; no first-inbound fallback.
+py3xui 0.3.2 remains locked for historical audit tests, with no runtime imports.
 
 ## Authentication
 
-`XUIAuthMode.SESSION` uses one `aiohttp.ClientSession` with its own cookie jar per adapter instance. It GETs `<base>/csrf-token`, validates `{success:true,obj:<nonempty string>}`, retains the returned `3x-ui` cookie and token, then POSTs `<base>/login` with JSON `username`, `password`, optional `twoFactorCode`, and `X-CSRF-Token`. The login response must report success and establish the session cookie. The upstream login saves the user in that same session; the checked [CSRF source](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/session/csrf.go) does not rotate the CSRF token on login. The retained `csrf_token` property is for a later write-capable patch; no write API is exposed now.
+SESSION default: GET /csrf-token, retain 3x-ui cookie/token, POST /login JSON
+username/password/optional twoFactorCode with X-CSRF-Token. Every authenticated
+POST sends CSRF. Token is not rotated on login. No mutation replay on auth failure.
+Adapter supports 2FA code; shop does not configure rotating 2FA credentials.
 
-`XUIAuthMode.TOKEN` sends `Authorization: Bearer <token>` on read calls and never calls login. `authenticate()` only prepares this mode locally; token validity is determined by the first API response. [Backend scope allowlists](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/api.go) allow `monitor` to read `/server/status` but not inbound/client data. `node-sync` permits inbound list and some writes, but not all canonical client, traffic and link reads. An **admin-scope** token is therefore required for the adapter's complete read surface. No token creation or scope escalation is implemented.
+TOKEN: explicit XUI_AUTH_MODE=token and XUI_API_TOKEN. Bearer header, no login or
+CSRF. Shop requires admin scope: monitor allows status only; node-sync lacks the
+canonical reconciliation/settings reads. Legacy XUI_TOKEN is never Bearer.
+[Scope routes](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/api.go),
+[CSRF middleware](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/session/csrf.go).
 
-The `XUI_TOKEN` setting of the existing shop has legacy py3xui loginSecret semantics. It is not interpreted as a Bearer token. Runtime config uses `XUI_AUTH_MODE=session` by default and requires `XUI_USERNAME`/`XUI_PASSWORD`. Explicit `XUI_AUTH_MODE=token` requires the separate `XUI_API_TOKEN` and does not require username/password. The runtime passes these credentials only to the matching adapter mode. A static two-factor code is not configured by the shop; a 2FA-enabled session account needs a separate approved strategy, or an appropriate API token.
+## Endpoints
 
-## Read methods
+All paths include configured panel web base path. JSON envelopes: success/msg/obj.
 
-All paths include the configured panel web base path. The method signatures live in `adapter.py`.
-
-| Method | HTTP route | Result |
+| Method | HTTP route | Return |
 |---|---|---|
-| `authenticate()` | GET `/csrf-token`, POST `/login` in session mode; no HTTP in token mode | Authenticated cookie+CSRF or configured Bearer mode |
-| `get_server_status()` | GET `/panel/api/server/status` | `XUIServerStatus(panel_version, xray_version, xray_state)` |
-| `list_inbounds()` | GET `/panel/api/inbounds/list` | Tuple of `XUIInboundSummary`, preserving all returned IDs and order |
-| `get_inbound(id)` | Filters `list_inbounds()` | Exact ID or `XUINotFoundError` |
-| `get_client(email)` | GET `/panel/api/clients/get/{email}` | `XUIClient` from `obj.client` and **all** `obj.inboundIds` |
-| `get_client_traffic(email)` | GET `/panel/api/clients/traffic/{email}` | `XUIClientTraffic` or `None` when `obj:null` |
-| `get_subscription_links(sub_id)` | GET `/panel/api/clients/subLinks/{subId}` | Tuple of protocol share URLs |
+| authenticate | GET /csrf-token, POST /login (SESSION only) | None |
+| get_server_status | GET /panel/api/server/status | XUIServerStatus |
+| list_inbounds/get_inbound | GET /panel/api/inbounds/list, exact ID filter | XUIInboundSummary |
+| get_client | GET /panel/api/clients/get/{email} | XUIClient or XUINotFoundError |
+| get_client_traffic | GET /panel/api/clients/traffic/{email} | XUIClientTraffic or None |
+| get_subscription_links | GET /panel/api/clients/subLinks/{subId} | Share links, NOT HTTP subscription URL |
+| get_subscription_base_url | POST /panel/api/setting/all (read-only) | Validated explicit subURI |
+| add_client | POST /panel/api/clients/add | XUIWriteResult |
+| update_client | POST /panel/api/clients/update/{email} | XUIWriteResult |
 
-**Correction to Patch 6A:** [the official endpoint contract](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/docs/public/openapi.json) and [subscription link provider](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/sub/links.go) show that `/clients/subLinks/{subId}` returns protocol URLs such as `vless://`, `vmess://` and `trojan://`. It does **not** return the HTTP(S) subscription endpoint URL that `VPNService.get_key()` builds. The requested adapter method name is retained, but its documented result is exact. Resolving the HTTP subscription URL from panel settings remains a separate 6B.2 task. No URL is constructed manually by this adapter.
+[Controller](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go):
+add JSON {client: model.Client including limitHwid, inboundIds: [configured ID]}.
+Update is flat full model.Client including limitHwid, not PATCH. Optional update
+query inboundIds filters applied inbounds, does not change memberships. Shop omits
+that filter, updating shared state across preserved memberships. No attachment,
+delete, inbound mutation or reset-traffic API is exposed by this adapter.
 
-## Identity and isolation
+## Identity and multi-inbound isolation
 
-`XUIClient.record_id` is the numeric client database key. `XUIClient.uuid` is the canonical credential UUID from `obj.client.uuid`; the adapter never substitutes the traffic row ID. `XUIClientTraffic.id` is a separate numeric traffic record key, with optional `uuid` solely as traffic metadata. `email` is the canonical lookup key. All `inboundIds` are preserved as a tuple; `is_member_of()` and `validate_client_membership()` check a **caller-supplied positive configured ID** without choosing an inbound. No first-inbound selection exists.
+Canonical client.uuid is credential UUID. Canonical record_id and traffic.id are
+independent numeric keys. Email is current shop Telegram ID string. UUID must equal
+User.vpn_id; configured ID must be present in all returned inboundIds. Create only
+attaches configured inbound. Update cannot change membership set. Shared expiry
+and enable changes affect all memberships; disabled/non-VLESS attachments fail
+closed. Membership preservation does not imply per-inbound quota/expiry isolation.
 
-Models validate the fields used for identity, quotas, expiry and future update preservation. Their `raw` dictionaries retain other current backend fields without using them for typed identity checks. Raw payloads, URLs, credentials, cookies and CSRF tokens are not logged; raw fields are hidden from model repr. This foundation does not yet establish ownership of an existing 3x-ui client or prevent edits to a multi-inbound client: there are no edit methods.
+## Write model and field preservation
 
-## Errors, TLS and lifetime
+XUIClientWrite explicitly carries UUID/email, memberships, expiry milliseconds,
+quota bytes, IP/HWID limits, tgId/subId, enable, flow/comment/reset. Raw preservation
+uses a checked model.Client allowlist; identity overrides raw, server IDs/timestamps
+are excluded. Missing preservation fields fail closed. allowedIPs canonical JSON
+text is decoded to wire array; reverse remains object/null. Types are validated.
+Renewal preserves quota, subId, HWID, flow, comment, resets/calendar, traffic reset,
+group, reverse and credential fields. Future unknown fields are not blindly echoed.
 
-Malformed JSON, malformed envelope, missing required objects and invalid typed fields raise `XUIProtocolError`. `success:false` raises `XUIAPIError`, except the canonical lookup's GORM `record not found` message is mapped to `XUINotFoundError`. Other locale/DB errors remain API errors; callers must not infer absence from them. HTTP 401/403 and login failures map to auth/authorization errors; transport/timeout and other HTTP failures raise `XUITransportError`. Exception text does not include response bodies, full URLs or secrets. An unauthenticated session request may be masked by upstream as HTTP 404; the adapter treats that case as authentication failure, while a token-mode 404 is not-found. A session auth failure clears local auth state for a later explicit call; there is no automatic replay.
+[Model](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/database/model/model.go),
+[CRUD semantics](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/client_crud.go).
 
-`aiohttp` performs TLS certificate verification by default. No `ssl=False`, custom trust bypass, redirect following or automatic retry is used. `timeout_seconds` bounds each request. One session/cookie jar is lazily created per adapter; use `async with XUIAdapter(...)` or `await close()`. A closed adapter cannot be reused. No public create, update, delete, disable or inbound modification method exists.
+Update re-reads canonical state before POST. Changed preservation snapshot fails
+closed unless desired state is already present. Backend has no compare-and-set;
+external edits between final GET and POST remain a race requiring operational
+isolation. Canonical read cannot prove successful fanout to remote Xray nodes.
 
-## Fixtures and next integration step
+## Create/renewal policy
 
-`tests/fixtures/xui/v3_8_5/` contains minimal synthetic envelopes derived from the checked [controllers](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go), [backend models](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/database/model/model.go), [traffic model](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/xray/client_traffic.go), [server status](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/server.go) and subscription link provider. They are not production captures. `tests/test_xui_adapter.py` drives a local aiohttp HTTP server to verify wire behavior and failure handling.
+Create: User.vpn_id UUID/subId, configured membership only, epoch-ms expiry,
+quota 0 means unlimited bytes, enabled by default. Supported shop creation:
+VLESS TCP + TLS/Reality + Vision enabled. Unsupported protocol/transport/security
+or disableFlow fails closed. Conditional XHTTP support in upstream is outside
+this patch. [Flow source](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/inbound_protocol.go).
+limitIp means IP limit, NOT physical device count; HWID is separate. Existing UI
+terminology remains. Server assignment follows verified canonical persistence.
 
-## Runtime integration status (Patch 6B.2a)
+Positive active expiry extends from expiry; expired positive expiry extends from
+now; change-subscription starts from now. Zero unlimited/negative delayed-start
+require manual review. Renewal does not overwrite quota/flow. Legacy optional
+quota/flow override arguments are rejected when not the preserved default policy.
 
-`ServerPoolService` owns one `XUIAdapter` and session per available server. Startup and refresh authenticate, read `/server/status`, require panel v3.8.5 and running Xray, then list inbounds. Provisioning eligibility requires the exact configured `XUI_INBOUND_ID` to exist, be enabled and have a known panel protocol. The typed inbound summary retains protocol, remark, tag and stream settings for the next patch. Failed candidates are closed immediately; refresh/removal closes old sessions; shutdown and startup failure paths close all remaining adapters. Modern authentication does not invoke py3xui login.
+## Ambiguous writes and reconciliation
 
-`VPNService.is_client_exists`, `get_client_data` and `get_limit_ip` use canonical client lookup and membership from the adapter. The shop compares `User.vpn_id` only to canonical `client.uuid`; the numeric traffic row ID is never used for identity. Usage and expiry presentation come from the separate traffic response. Missing canonical client is reported as absent. Panel failures, mismatched UUID or missing configured membership are translated to a generic `VPNReadError` for purchase flows; the user-facing status read returns `None`, as before. A failed read must not be interpreted as a missing client by purchase logic.
+Automatic mutation retries: NONE. Pre-read existing email: identical intended
+state/UUID/membership -> success without POST; mismatch -> review, never duplicate
+or implicit attach. Every POST is followed by canonical desired-state verification.
+Timeout/drop/malformed response/error envelope/HTTP error may follow partial commit:
+GET only, never resend POST. Matching state returns reconciled result with
+node_pending=None (activation unknown); missing/mismatched state raises
+XUIReconciliationError, a subclass of XUIAmbiguousWriteError.
 
-**Read path: modern 3x-ui 3.8.5 adapter. Write path: legacy py3xui, not modernized.** `create_client` and `update_client` retain their legacy py3xui add/update calls. They do not gain modern write support in 6B.2a. Their preconditions now use modern inbound/canonical checks where safely separable, but `update_client` still performs a legacy lookup solely to hydrate the old write model. The shop does not log py3xui in at startup: its 0.3.2 login is incompatible with v3.8.5 CSRF. On the target panel, legacy add/update therefore fail closed and cannot be considered operational provisioning. Token mode has no legacy write client at all. Do not sell or renew on this transitional branch until 6B.2b supplies modern writes and separately verifies them.
+Persistence confirmation != node activation confirmation.
+XUIWriteResult.success means canonical persistence verified, not node activation.
+node_pending=False means a valid write response explicitly returned nodePending=false;
+True means a valid write response explicitly returned nodePending=true.
+None means canonical persistence confirmed but activation unknown: no-POST existing
+or already-desired shortcuts, success with obj=null, or a lost mutation response.
+VPNService accepts only False for completed provisioning;
+True/None raises uncertainty. Existing payment state machine sends uncertainty to
+REVIEW_REQUIRED and duplicate callback does not replay writes. No payment code
+changed. Manual recovery must inspect panel/order; expiry intent is not separately
+durable, and exactly-once writes across crashes are not claimed. Notification and
+referral post-completion crash windows remain unchanged.
 
-6B.2b must implement modern add/update with exact inbound and ownership policy, preserve credentials and unrelated quota/reset/metadata fields, adapt renewal to canonical/traffic records, handle ambiguous side effects, and resolve the actual HTTP subscription URL from verified panel settings. No production write test is part of 6B.2a.
+## HTTP subscription URL
+
+subLinks returns protocol share links (vless:// etc.), not HTTP subscription URL.
+[Official BuildURLs](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/sub/service.go)
+uses subURI if set, else settings/host context. Public reverse proxy cannot safely
+be inferred from panel host.
+
+Set XUI_SUBSCRIPTION_BASE_URL=https://sub.example/custom/sub/ or leave empty to read
+explicit panel subURI via read-only POST /setting/all. Require HTTPS, hostname,
+trailing-slash path, no credentials/query/fragment/invalid port/control characters.
+Append validated canonical subId (create uses User.vpn_id; renewal preserves it). No
+legacy /user/ fallback. Override is shared across pool; for distinct subscription
+hosts configure subURI per panel. Validation does not prove public reachability.
+
+## Errors/TLS/secrets
+
+Typed auth/authorization/not-found/protocol/API/transport errors remain; mutation
+uncertainty adds ambiguous/reconciliation errors. Exception messages contain no
+response body, credentials or URL. TLS verification ON, no ssl=False, redirects,
+environment proxy trust or retries. Request timeout bounds each operation. Sessions
+close explicitly. Raw/secrets hidden from repr; no full keys/share URLs logged.
+
+## Local verification and remaining work
+
+Loopback HTTP tests cover auth/wire body, preservation, memberships, stale snapshot,
+nodePending, timeout/drop/malformed/error reconciliation, no retries and logging.
+Service tests cover expiry/ownership/server assignment, REVIEW_REQUIRED and URL.
+Fixtures are synthetic source-derived v3.8.5 responses, not production captures.
+
+Later separate stages: controlled live read smoke; dedicated SHOP-TEST inbound;
+controlled create/verify/update expiry/verify/optional cleanup; Telegram E2E;
+Stars real payment pilot. No live testing in this patch.

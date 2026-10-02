@@ -1,9 +1,11 @@
-"""Small read models for the 3x-ui v3.8.5 API; independent of py3xui."""
+"""Typed models for the 3x-ui v3.8.5 API; independent of py3xui."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import json
+from copy import deepcopy
 from typing import Any
 
 from .exceptions import XUIAuthorizationError, XUIProtocolError
@@ -142,6 +144,123 @@ class XUIClientTraffic:
             expiry_time_ms=_int(data, "expiryTime"), enable=_bool(data, "enable"),
             uuid=uuid, inbound_id=_int(data, "inboundId"), raw=data.copy(),
         )
+
+
+# The Go update endpoint decodes a full model.Client, not a PATCH. Only fields
+# declared by that model are round-tripped; record IDs and server timestamps
+# must never be sent back. Typed identity always overrides raw values.
+CLIENT_WRITE_FIELDS = frozenset({
+    "security", "password", "reverse", "auth", "privateKey",
+    "publicKey", "allowedIPs", "preSharedKey", "keepAlive",
+    "forwardedPorts", "secret", "adTag", "group",
+    "resetDay", "resetMax", "trafficReset", "trafficResetDay",
+})
+CLIENT_WRITE_DEFAULTS = {
+    "security": "auto", "password": "", "reverse": None, "auth": "",
+    "privateKey": "", "publicKey": "", "allowedIPs": [], "preSharedKey": "",
+    "keepAlive": 0, "forwardedPorts": "", "secret": "", "adTag": "", "group": "",
+    "resetDay": 0, "resetMax": 0, "trafficReset": "never", "trafficResetDay": 1,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class XUIClientWrite:
+    email: str
+    uuid: str = field(repr=False)
+    inbound_ids: tuple[int, ...]
+    expiry_time_ms: int
+    total_bytes: int
+    limit_ip: int
+    limit_hwid: int
+    tg_id: int
+    sub_id: str = field(repr=False)
+    enable: bool = True
+    flow: str = ""
+    comment: str = ""
+    reset: int = 0
+    preserved: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.email or not self.uuid or not self.sub_id:
+            raise ValueError("Client email, UUID and subId are required")
+        if not self.inbound_ids or any(type(i) is not int or i <= 0 for i in self.inbound_ids):
+            raise ValueError("Positive inbound IDs are required")
+        if len(set(self.inbound_ids)) != len(self.inbound_ids):
+            raise ValueError("Duplicate inbound IDs")
+        if (type(self.expiry_time_ms) is not int or self.expiry_time_ms <= 0
+                or any(type(x) is not int or x < 0 for x in
+                       (self.total_bytes, self.limit_ip, self.limit_hwid, self.tg_id))
+                or type(self.enable) is not bool):
+            raise ValueError("Invalid client write fields")
+        if set(self.preserved) - CLIENT_WRITE_FIELDS:
+            raise ValueError("Unsupported preserved client field")
+        for key, value in self.preserved.items():
+            if key == "reverse":
+                valid = value is None or (isinstance(value, dict)
+                         and set(value) == {"tag"} and isinstance(value["tag"], str))
+            elif key == "allowedIPs":
+                valid = isinstance(value, list) and all(isinstance(i, str) for i in value)
+            else:
+                valid = type(value) is type(CLIENT_WRITE_DEFAULTS[key])
+            if not valid:
+                raise XUIProtocolError("Invalid preserved client field")
+        object.__setattr__(self, "preserved", deepcopy(self.preserved))
+        if (not isinstance(self.flow, str) or not isinstance(self.comment, str)
+                or type(self.reset) is not int):
+            raise ValueError("Invalid client metadata")
+        for value in (self.email, self.sub_id):
+            if any(c.isspace() or ord(c) < 32 or c in "/\\" for c in value):
+                raise ValueError("Invalid client identifier")
+
+    @classmethod
+    def from_client(cls, client: XUIClient, *, expiry_time_ms: int,
+                    limit_ip: int, enable: bool) -> XUIClientWrite:
+        if CLIENT_WRITE_FIELDS - client.raw.keys():
+            raise XUIProtocolError("Canonical client lacks preservation fields")
+        preserved = deepcopy({key: client.raw[key] for key in CLIENT_WRITE_FIELDS if key in client.raw})
+        # ClientRecord stores this as JSON text; model.Client accepts []string.
+        if "allowedIPs" in preserved:
+            value = preserved["allowedIPs"]
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value) if value else []
+                except ValueError as exc:
+                    raise XUIProtocolError("Invalid canonical allowedIPs") from exc
+            if value is None:
+                value = []
+            if not isinstance(value, list) or any(not isinstance(i, str) for i in value):
+                raise XUIProtocolError("Invalid canonical allowedIPs")
+            preserved["allowedIPs"] = value
+        return cls(
+            email=client.email, uuid=client.uuid, inbound_ids=client.inbound_ids,
+            expiry_time_ms=expiry_time_ms, total_bytes=client.total_bytes,
+            limit_ip=limit_ip, limit_hwid=client.limit_hwid, tg_id=client.tg_id,
+            sub_id=client.sub_id, enable=enable,
+            flow=client.flow, comment=client.comment, reset=client.reset,
+            preserved=preserved,
+        )
+
+    def client_payload(self) -> dict[str, Any]:
+        payload = deepcopy(CLIENT_WRITE_DEFAULTS)
+        payload.update(deepcopy(self.preserved))
+        payload.update({
+            "id": self.uuid, "email": self.email, "enable": self.enable,
+            "expiryTime": self.expiry_time_ms, "totalGB": self.total_bytes,
+            "limitIp": self.limit_ip, "limitHwid": self.limit_hwid,
+            "tgId": self.tg_id, "subId": self.sub_id,
+            "flow": self.flow, "comment": self.comment, "reset": self.reset,
+        })
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class XUIWriteResult:
+    client: XUIClient = field(repr=False)
+    # False/True only from an explicit mutation response nodePending boolean.
+    # None: persistence confirmed, but node activation is unknown.
+    node_pending: bool | None
+    reconciled: bool
+    success: bool = True  # Canonical persistence verified, not node activation.
 
 
 def is_member_of(client: XUIClient, inbound_id: int) -> bool:

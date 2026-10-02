@@ -1,10 +1,10 @@
 import logging
-from dataclasses import dataclass, field
 import re
+from dataclasses import dataclass, field
 from ipaddress import ip_network
 from logging.handlers import MemoryHandler
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from environs import Env
 from marshmallow.validate import OneOf, Range
@@ -106,6 +106,7 @@ class XUIConfig:
     SUBSCRIPTION_PATH: str
     AUTH_MODE: str = "session"
     API_TOKEN: str | None = field(default=None, repr=False)
+    SUBSCRIPTION_BASE_URL: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -204,6 +205,21 @@ def required_xui_credential(env: Env, name: str) -> str:
     value = env.str(name, default=None)
     if not value or not value.strip():
         raise ValueError(f"{name} is required for the selected XUI_AUTH_MODE")
+    return value
+
+
+def parse_subscription_base_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+        parts.port
+    except ValueError as exc:
+        raise ValueError("XUI_SUBSCRIPTION_BASE_URL must be an HTTPS URL ending in /") from exc
+    if (any(c.isspace() or ord(c) < 32 for c in value) or "\\" in value
+            or parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+            or parts.query or parts.fragment or not parts.path or not parts.path.endswith("/")):
+        raise ValueError("XUI_SUBSCRIPTION_BASE_URL must be an HTTPS URL ending in /")
     return value
 
 
@@ -399,6 +415,9 @@ def load_config() -> Config:
             ),
             AUTH_MODE=xui_auth_mode,
             API_TOKEN=xui_api_token,
+            SUBSCRIPTION_BASE_URL=parse_subscription_base_url(
+                env.str("XUI_SUBSCRIPTION_BASE_URL", default=None)
+            ),
         ),
         cryptomus=CryptomusConfig(
             API_KEY=cryptomus_api_key,
