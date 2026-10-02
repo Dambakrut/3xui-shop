@@ -161,16 +161,45 @@ class VPNService:
         return key
 
     @staticmethod
-    def _creation_flow(inbound, requested_flow: str) -> str:
-        # Existing shop creates UUID-based VLESS clients with Vision. Other
-        # protocols need their own credential and flow policy.
-        settings = inbound.stream_settings or {}
-        if (inbound.protocol != "vless" or inbound.raw.get("disableFlow") is True
-                or settings.get("security") not in ("tls", "reality")
-                or settings.get("network") != "tcp"
-                or requested_flow != "xtls-rprx-vision"):
-            raise VPNReadError("Configured inbound is not compatible with shop VLESS Vision provisioning")
-        return requested_flow
+    def _validate_provisioning_capability(inbound, requested_flow: str | None) -> str:
+        """Resolve a verified transport policy; never rewrite an existing flow.
+
+        None selects the create default. Renewal passes the canonical flow and
+        validates every attachment. See docs/3xui-adapter.md for source rules.
+        """
+        policies = {
+            ("vless", "tls", "tcp"): ("xtls-rprx-vision", ("", "xtls-rprx-vision")),
+            ("vless", "reality", "tcp"): ("xtls-rprx-vision", ("", "xtls-rprx-vision")),
+            ("vless", "reality", "xhttp"): ("", ("",)),
+        }
+        stream = inbound.stream_settings or {}
+        policy = policies.get((inbound.protocol, stream.get("security"), stream.get("network")))
+        if not inbound.enable or policy is None:
+            raise VPNReadError("Inbound has an unsupported shop provisioning capability")
+        default_flow, allowed_flows = policy
+        flow = default_flow if requested_flow is None else requested_flow
+        if flow not in allowed_flows:
+            raise VPNReadError("Client flow is incompatible with inbound capability")
+        disable_flow = inbound.raw.get("disableFlow", False)
+        if type(disable_flow) is not bool:
+            raise VPNReadError("Inbound disableFlow is malformed")
+        if stream.get("network") == "tcp" and disable_flow:
+            # Preserve the existing TCP shop contract; XHTTP's empty flow does
+            # not depend on this panel switch (clientWithInboundFlow).
+            raise VPNReadError("TCP shop provisioning requires flow enabled")
+        if flow == "":
+            protocol_settings = inbound.raw.get("settings")
+            # Xray's VLessInboundConfig inherits settings.flow when the client
+            # flow is empty. Prove that empty really remains empty.
+            if not isinstance(protocol_settings, dict) or protocol_settings.get("flow", "") != "":
+                raise VPNReadError("Empty client flow requires verified empty inbound flow")
+        if stream.get("network") == "xhttp":
+            xhttp = stream.get("xhttpSettings")
+            if not isinstance(xhttp, dict) or xhttp.get("mode", "") not in (
+                "", "auto", "stream-one", "stream-up", "packet-up",
+            ):
+                raise VPNReadError("XHTTP transport settings are unsupported or unavailable")
+        return flow
 
     async def create_client(
         self,
@@ -178,7 +207,7 @@ class VPNService:
         devices: int,
         duration: int,
         enable: bool = True,
-        flow: str = "xtls-rprx-vision",
+        flow: str | None = None,
         total_gb: int = 0,
     ) -> bool:
         logger.info(f"Creating new client {user.tg_id} | {devices} devices {duration} days.")
@@ -204,7 +233,7 @@ class VPNService:
                 expiry_time_ms=days_to_timestamp(duration), total_bytes=total_gb,
                 limit_ip=devices, limit_hwid=0, tg_id=user.tg_id,
                 sub_id=user.vpn_id, enable=enable,
-                flow=self._creation_flow(inbound, flow),
+                flow=self._validate_provisioning_capability(inbound, flow),
             )
             result = await connection.adapter.add_client(write)
             if not user.server_id and not await self.server_pool_service.assign_server_to_user(
@@ -229,7 +258,7 @@ class VPNService:
         replace_devices: bool = False,
         replace_duration: bool = False,
         enable: bool = True,
-        flow: str = "xtls-rprx-vision",
+        flow: str | None = None,
         total_gb: int = 0,
     ) -> bool:
         logger.info(f"Updating client {user.tg_id} | {devices} devices {duration} days.")
@@ -246,14 +275,15 @@ class VPNService:
             current_device_limit = await self.get_limit_ip(user=user, client=canonical)
             if current_device_limit is None:
                 return False
-            if duration <= 0 or devices < 0 or total_gb != 0 or flow != "xtls-rprx-vision":
+            if (duration <= 0 or devices < 0 or total_gb != 0
+                    or (flow is not None and flow != canonical.flow)):
                 return False
             # An update changes the shared client record. All attached
-            # inbounds must be VLESS; mixed credentials need manual handling.
+            # inbounds must support the preserved canonical flow. Never ignore
+            # other memberships or normalize their shared credential/flow.
             for inbound_id in canonical.inbound_ids:
                 inbound = await connection.adapter.get_inbound(inbound_id)
-                if not inbound.enable or inbound.protocol != "vless":
-                    raise VPNReadError("Client has an unsupported inbound attachment")
+                self._validate_provisioning_capability(inbound, canonical.flow)
 
             if not replace_devices:
                 devices = current_device_limit + devices

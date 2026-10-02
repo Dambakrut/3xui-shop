@@ -54,6 +54,146 @@ class VPNWriteTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.vpn = VPNService(self.config, FakeSession, self.pool)
 
+    def use_xhttp(self):
+        from app.integrations.xui import XUIInboundSummary
+
+        data = json.loads((ROOT / "tests/fixtures/xui/v3_8_5/inbound_xhttp.json").read_text())
+        self.inbound = XUIInboundSummary.from_api(data)
+        self.config.xui.INBOUND_ID = 6
+        self.pool.validate_configured_inbound.return_value = self.inbound
+        self.adapter.get_inbound.return_value = self.inbound
+        self.client = replace(self.client, flow="", inbound_ids=(99, 6))
+        self.adapter.get_client.return_value = self.client
+
+    async def test_xhttp_create_resolves_empty_flow_and_only_configured_membership(self):
+        self.use_xhttp()
+        self.assertTrue(await self.vpn.create_client(self.user, 2, 30))
+        write = self.adapter.add_client.await_args.args[0]
+        self.assertEqual(write.flow, "")
+        self.assertEqual(write.client_payload()["flow"], "")
+        self.assertNotIn("xtls-rprx-vision", json.dumps(write.client_payload()))
+        self.assertEqual(write.inbound_ids, (6,))
+        self.assertEqual(write.uuid, UUID)
+
+    async def test_xhttp_explicit_vision_and_unknown_flows_fail_without_post(self):
+        self.use_xhttp()
+        for flow in ("xtls-rprx-vision", "xtls-rprx-vision-udp443", "unknown"):
+            with self.subTest(flow=flow):
+                self.assertFalse(await self.vpn.create_client(self.user, 2, 30, flow=flow))
+        self.adapter.add_client.assert_not_awaited()
+
+    async def test_xhttp_disabled_or_unsupported_capabilities_fail_without_post(self):
+        self.use_xhttp()
+        for inbound in (
+            replace(self.inbound, enable=False),
+            replace(self.inbound, protocol="vmess"),
+            replace(self.inbound, stream_settings={**self.inbound.stream_settings, "security": "none"}),
+            replace(self.inbound, stream_settings={**self.inbound.stream_settings, "security": "tls"}),
+            replace(self.inbound, stream_settings={**self.inbound.stream_settings, "network": "grpc"}),
+            replace(self.inbound, stream_settings={"security": "reality", "network": "xhttp"}),
+            replace(self.inbound, stream_settings={**self.inbound.stream_settings,
+                    "xhttpSettings": {"mode": "unknown"}}),
+            replace(self.inbound, raw={**self.inbound.raw, "disableFlow": "false"}),
+        ):
+            self.pool.validate_configured_inbound.return_value = inbound
+            with self.subTest(inbound=inbound):
+                self.assertFalse(await self.vpn.create_client(self.user, 2, 30))
+        self.adapter.add_client.assert_not_awaited()
+
+    async def test_xhttp_disable_flow_does_not_disable_empty_flow_clients(self):
+        self.use_xhttp()
+        self.pool.validate_configured_inbound.return_value = replace(
+            self.inbound, raw={**self.inbound.raw, "disableFlow": True},
+        )
+        self.assertTrue(await self.vpn.create_client(self.user, 2, 30))
+        self.assertEqual(self.adapter.add_client.await_args.args[0].flow, "")
+        self.adapter.get_inbound.return_value = self.pool.validate_configured_inbound.return_value
+        self.assertTrue(await self.vpn.update_client(self.user, 2, 30))
+        self.assertEqual(self.adapter.update_client.await_args.args[1].flow, "")
+
+    def test_xhttp_transport_modes_leave_client_flow_empty(self):
+        self.use_xhttp()
+        for mode in ("", "auto", "stream-one", "stream-up", "packet-up"):
+            inbound = replace(self.inbound, stream_settings={
+                **self.inbound.stream_settings, "xhttpSettings": {"mode": mode},
+            })
+            with self.subTest(mode=mode):
+                self.assertEqual(self.vpn._validate_provisioning_capability(inbound, None), "")
+
+    async def test_xhttp_vless_encryption_does_not_implicitly_enable_vision(self):
+        self.use_xhttp()
+        self.pool.validate_configured_inbound.return_value = replace(self.inbound, raw={
+            **self.inbound.raw, "settings": {"flow": "", "encryption": "synthetic-vlessenc"},
+        })
+        self.assertTrue(await self.vpn.create_client(self.user, 2, 30))
+        self.assertEqual(self.adapter.add_client.await_args.args[0].flow, "")
+        self.adapter.add_client.reset_mock()
+        self.assertFalse(await self.vpn.create_client(self.user, 2, 30, flow="xtls-rprx-vision"))
+        self.adapter.add_client.assert_not_awaited()
+
+    async def test_xhttp_unknown_activation_keeps_payment_review_and_duplicate_noop(self):
+        self.use_xhttp()
+        await self.test_unknown_activation_result_enters_payment_review_without_rewards_or_retry()
+
+    async def test_empty_flow_cannot_inherit_global_vision_or_unknown_settings(self):
+        self.use_xhttp()
+        for settings in (None, "{}", {"flow": "xtls-rprx-vision"}, {"flow": None}):
+            inbound = replace(self.inbound, raw={**self.inbound.raw, "settings": settings})
+            self.pool.validate_configured_inbound.return_value = inbound
+            self.adapter.get_inbound.return_value = inbound
+            with self.subTest(settings=settings):
+                self.assertFalse(await self.vpn.create_client(self.user, 2, 30))
+                self.assertFalse(await self.vpn.update_client(self.user, 2, 30))
+        self.adapter.add_client.assert_not_awaited()
+        self.adapter.update_client.assert_not_awaited()
+
+    async def test_xhttp_update_preserves_fields_and_checks_every_attachment(self):
+        self.use_xhttp()
+        self.assertTrue(await self.vpn.update_client(self.user, 2, 30, replace_devices=True))
+        current, write = self.adapter.update_client.await_args.args
+        self.assertIs(current, self.client)
+        self.assertEqual(write.inbound_ids, (99, 6))
+        self.assertEqual([call.args[0] for call in self.adapter.get_inbound.await_args_list], [99, 6])
+        for field in ("flow", "total_bytes", "sub_id", "limit_hwid", "comment", "reset"):
+            self.assertEqual(getattr(write, field), getattr(self.client, field))
+
+    async def test_xhttp_shared_unsupported_attachment_blocks_update_in_any_order(self):
+        self.use_xhttp()
+        for other in (
+            replace(self.inbound, protocol="trojan"),
+            replace(self.inbound, enable=False),
+            replace(self.inbound, stream_settings={"security": "reality", "network": "grpc"}),
+            replace(self.inbound, stream_settings={**self.inbound.stream_settings, "security": "tls"}),
+        ):
+            self.adapter.get_inbound.side_effect = lambda inbound_id: self.inbound if inbound_id == 6 else other
+            for memberships in ((99, 6), (6, 99)):
+                self.adapter.get_client.return_value = replace(self.client, inbound_ids=memberships)
+                with self.subTest(other=other, memberships=memberships):
+                    self.assertFalse(await self.vpn.update_client(self.user, 2, 30))
+        self.adapter.update_client.assert_not_awaited()
+
+    async def test_xhttp_existing_vision_is_not_silently_normalized(self):
+        self.use_xhttp()
+        self.adapter.get_client.return_value = replace(self.client, flow="xtls-rprx-vision")
+        self.assertFalse(await self.vpn.update_client(self.user, 2, 30))
+        self.adapter.update_client.assert_not_awaited()
+
+    async def test_shared_tcp_xhttp_empty_flow_preserved_and_flow_override_rejected(self):
+        self.use_xhttp()
+        tcp = replace(self.inbound, stream_settings={"security": "tls", "network": "tcp"})
+        self.adapter.get_inbound.side_effect = lambda inbound_id: self.inbound if inbound_id == 6 else tcp
+        self.assertTrue(await self.vpn.update_client(self.user, 2, 30))
+        self.assertEqual(self.adapter.update_client.await_args.args[1].flow, "")
+        self.adapter.update_client.reset_mock()
+        self.assertFalse(await self.vpn.update_client(self.user, 2, 30, flow="xtls-rprx-vision"))
+        self.adapter.update_client.assert_not_awaited()
+
+    def test_tcp_tls_and_reality_defaults_preserve_vision(self):
+        for security in ("tls", "reality"):
+            inbound = replace(self.inbound, stream_settings={"security": security, "network": "tcp"})
+            with self.subTest(security=security):
+                self.assertEqual(self.vpn._validate_provisioning_capability(inbound, None), "xtls-rprx-vision")
+
     async def test_create_uses_one_configured_inbound_and_assigns_after_add(self):
         self.user.server_id = None
         self.adapter.get_client.side_effect = None

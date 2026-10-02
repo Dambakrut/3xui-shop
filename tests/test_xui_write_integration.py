@@ -42,6 +42,8 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response({"success": True, "obj": {
                     "client": self.record, "inboundIds": self.memberships,
                 }})
+            if path == "/base/panel/api/inbounds/list":
+                return web.json_response({"success": True, "obj": self.inbounds})
             if path == "/base/panel/api/setting/all":
                 self.settings_headers = dict(request.headers)
                 return web.json_response({"success": True, "obj": {
@@ -126,6 +128,49 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["inboundIds"], [42])
         self.assertEqual(body["client"]["expiryTime"], 1900000000000)
         self.assertEqual(body["client"]["totalGB"], 0)
+
+    async def test_xhttp_vpn_create_and_shared_renewal_wire_without_vision(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from app.bot.services.vpn import VPNService
+        from app.integrations.xui import XUIInboundSummary
+
+        data = json.loads((Path(__file__).parent / "fixtures/xui/v3_8_5/inbound_xhttp.json").read_text())
+        self.inbounds = [dict(data, id=99), data]
+        adapter = self.adapter(mode="token")
+        inbound = XUIInboundSummary.from_api(data)
+        user = SimpleNamespace(tg_id=123, vpn_id=UUID, server_id=7)
+        connection = SimpleNamespace(adapter=adapter)
+        pool = SimpleNamespace(
+            get_connection=AsyncMock(return_value=connection),
+            validate_configured_inbound=AsyncMock(return_value=inbound),
+        )
+        config = SimpleNamespace(xui=SimpleNamespace(INBOUND_ID=6))
+        vpn = VPNService(config, None, pool)
+        self.assertTrue(await vpn.create_client(user, 2, 30))
+        path, headers, body, query = self.posts[0]
+        self.assertEqual(path, "/base/panel/api/clients/add")
+        self.assertEqual(body["inboundIds"], [6])
+        self.assertEqual(body["client"]["flow"], "")
+        self.assertNotIn("xtls-rprx-vision", json.dumps(body))
+        self.assertEqual(headers["Authorization"], "Bearer admin-token")
+        self.assertNotIn("X-CSRF-Token", headers)
+        self.memberships = [99, 6]
+        self.record.update({"totalGB": 1234567, "limitHwid": 3,
+                            "comment": "preserve", "reset": 7})
+        before = copy.deepcopy(self.record)
+        self.assertTrue(await vpn.update_client(user, 4, 30, replace_devices=True))
+        path, _headers, body, query = self.posts[1]
+        self.assertEqual(path, "/base/panel/api/clients/update/123")
+        self.assertEqual(query, "")
+        for field in ("flow", "totalGB", "subId", "limitHwid", "comment", "reset"):
+            self.assertEqual(body[field], before[field])
+        self.assertEqual(body["expiryTime"], before["expiryTime"] + 30 * 86400000)
+        self.assertEqual(self.memberships, [99, 6])
+        self.assertNotIn("xtls-rprx-vision", json.dumps(body))
+        self.assertEqual(len(self.posts), 2)
 
     async def test_existing_identical_skips_post(self):
         self.stored()

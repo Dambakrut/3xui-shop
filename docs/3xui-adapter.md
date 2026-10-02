@@ -61,7 +61,7 @@ Canonical client.uuid is credential UUID. Canonical record_id and traffic.id are
 independent numeric keys. Email is current shop Telegram ID string. UUID must equal
 User.vpn_id; configured ID must be present in all returned inboundIds. Create only
 attaches configured inbound. Update cannot change membership set. Shared expiry
-and enable changes affect all memberships; disabled/non-VLESS attachments fail
+and enable changes affect all memberships; disabled/unsupported attachments fail
 closed. Membership preservation does not imply per-inbound quota/expiry isolation.
 
 ## Write model and field preservation
@@ -85,17 +85,77 @@ isolation. Canonical read cannot prove successful fanout to remote Xray nodes.
 ## Create/renewal policy
 
 Create: User.vpn_id UUID/subId, configured membership only, epoch-ms expiry,
-quota 0 means unlimited bytes, enabled by default. Supported shop creation:
-VLESS TCP + TLS/Reality + Vision enabled. Unsupported protocol/transport/security
-or disableFlow fails closed. Conditional XHTTP support in upstream is outside
-this patch. [Flow source](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/inbound_protocol.go).
+quota 0 means unlimited bytes, enabled by default. Creation and renewal use the
+explicit capability matrix below; unknown combinations fail closed.
 limitIp means IP limit, NOT physical device count; HWID is separate. Existing UI
 terminology remains. Server assignment follows verified canonical persistence.
 
 Positive active expiry extends from expiry; expired positive expiry extends from
 now; change-subscription starts from now. Zero unlimited/negative delayed-start
 require manual review. Renewal does not overwrite quota/flow. Legacy optional
-quota/flow override arguments are rejected when not the preserved default policy.
+quota overrides are rejected; an explicit renewal flow must equal the canonical
+flow. No flow conversion is performed during renewal.
+
+## XHTTP capability policy — 3x-ui v3.8.5 / Xray v26.9.30
+
+| Protocol | Security | Network | Flow | Shop support |
+|---|---|---|---|---|
+| VLESS | Reality | TCP | xtls-rprx-vision | Supported; creation default |
+| VLESS | TLS | TCP | xtls-rprx-vision | Supported; creation default |
+| VLESS | Reality / TLS | TCP | empty | Supported with verified empty inbound settings.flow |
+| VLESS | Reality | XHTTP | empty | Supported; creation default |
+| VLESS | Reality | XHTTP | xtls-rprx-vision | Rejected by shop; upstream allows it conditionally with VLESS encryption |
+| VLESS | TLS / other | XHTTP | any | Outside shop policy; rejected |
+| other / unknown | any | any | any | Rejected |
+
+This is a shop policy, not an exhaustive Xray support matrix. TCP retains the
+disableFlow=false requirement. XHTTP accepts either boolean disableFlow value
+because its client flow is empty; malformed values fail closed.
+
+3x-ui's [inboundCanEnableTlsFlow](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/inbound_protocol.go)
+permits Vision on TCP+TLS/Reality, and on XHTTP only with VLESS-level encryption
+(encryption/decryption settings). Reality alone is not that encryption.
+[clientWithInboundFlow](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/client_crud.go)
+clears flow when disableFlow is true or an attachment cannot enable it. This
+switch does not disable clients with empty flow. The shop deliberately supports
+only empty flow for XHTTP; it does not configure ML-KEM or infer its validity.
+
+[Xray VLessInboundConfig.Build](https://github.com/XTLS/Xray-core/blob/v26.9.30/infra/conf/vless.go)
+accepts empty/Vision client flow and UUID credentials. Empty client flow inherits
+inbound settings.flow: the shop requires readable settings with absent/empty flow
+before accepting an empty client flow. Nonempty global flow fails closed, even
+when disableFlow=true. No new credential is required for XHTTP. The udp443 suffix
+is an outbound option, not an accepted inbound client flow.
+
+[StreamConfig.Build](https://github.com/XTLS/Xray-core/blob/v26.9.30/infra/conf/transport_internet.go)
+maps xhttp to splithttp and permits Reality on this transport. XHTTP settings must
+be present as an object; mode must be empty, auto, stream-one, stream-up or packet-up,
+as handled by the [XHTTP server](https://github.com/XTLS/Xray-core/blob/v26.9.30/transport/internet/splithttp/hub.go).
+Host/path/extra/padding remain panel transport configuration, not client fields.
+The shop neither copies them into client requests nor mutates them. This guard
+does not validate every transport setting or prove a successful VPN handshake.
+
+The [canonical client controller](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go)
+uses the same JSON add/update routes for XHTTP: add {client, inboundIds}, update
+flat full client. Expiry milliseconds, quota bytes, enable, IP/HWID limits and subId
+remain in that client contract; memberships are preserved. Every attachment is
+validated against the actual canonical flow before update. A shared empty-flow
+TCP/XHTTP client is allowed only when all attachments pass; Vision/XHTTP and mixed
+unsupported attachments are rejected without a mutation.
+
+[Subscription service](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/sub/service.go)
+generates XHTTP share-link network/path/host/mode/extra parameters in
+applyShareNetworkParams/applyXhttpExtraParams. HTTP BuildURLs remains transport
+independent. No shop URL rule changes: panel subURI or the explicit HTTPS base is
+used, then canonical subId is appended. Correct source generation does not prove
+compatibility of every user VPN application with XHTTP extras.
+
+tests/fixtures/xui/v3_8_5/inbound_xhttp.json is synthetic, matching the known
+production combination and inbound ID, with invented transport details. It is
+not a production payload. No production request was performed in this patch.
+Historical 6C NOT READY described the previous TCP-only guard and remains an
+unchanged historical record. The next separate stage is an authorized SHOP-TEST
+write trial; activation, subscription reachability and VPN handshake remain unverified.
 
 ## Ambiguous writes and reconciliation
 

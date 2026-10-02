@@ -1,0 +1,23 @@
+{
+  "id": 6,
+  "protocol": "vless",
+  "enable": true,
+  "remark": "Synthetic XHTTP shop inbound",
+  "tag": "in-6",
+  "disableFlow": false,
+  "settings": {
+    "decryption": "none",
+    "encryption": "none",
+    "flow": ""
+  },
+  "streamSettings": {
+    "network": "xhttp",
+    "security": "reality",
+    "xhttpSettings": {
+      "mode": "auto",
+      "path": "/synthetic-xhttp",
+      "host": "",
+      "extra": {"xPaddingBytes": "100-1000"}
+    }
+  }
+}
