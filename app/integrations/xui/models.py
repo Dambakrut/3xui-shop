@@ -45,13 +45,15 @@ def _bool(data: dict[str, Any], key: str) -> bool:
 class XUIServerStatus:
     panel_version: str
     xray_version: str
+    xray_state: str
     raw: dict[str, Any] = field(repr=False)
 
     @classmethod
     def from_api(cls, value: Any) -> XUIServerStatus:
         data = _obj(value, "server status")
         xray = _obj(data.get("xray"), "xray")
-        return cls(_str(data, "panelVersion"), _str(xray, "version"), data.copy())
+        return cls(_str(data, "panelVersion"), _str(xray, "version"),
+                   _str(xray, "state"), data.copy())
 
 
 @dataclass(frozen=True, slots=True)

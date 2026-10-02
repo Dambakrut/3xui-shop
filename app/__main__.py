@@ -30,6 +30,7 @@ from app.db.database import Database
 
 
 async def on_shutdown(db: Database, bot: Bot, services: ServicesContainer) -> None:
+    await services.server_pool.close()
     await services.notification.notify_developer(BOT_STOPPED_TAG)
     await commands.delete(bot)
     await bot.delete_webhook()
@@ -112,65 +113,69 @@ async def main() -> None:
         bot=bot,
     )
 
-    # Sync servers
-    await services_container.server_pool.sync_servers()
+    try:
+        # Sync servers through the read-only 3x-ui adapter.
+        await services_container.server_pool.sync_servers()
 
-    # Register payment gateways
-    gateway_factory = GatewayFactory()
-    gateway_factory.register_gateways(
-        app=app,
-        config=config,
-        session=db.session,
-        storage=storage,
-        bot=bot,
-        i18n=i18n,
-        services=services_container,
-    )
+        # Register payment gateways
+        gateway_factory = GatewayFactory()
+        gateway_factory.register_gateways(
+            app=app,
+            config=config,
+            session=db.session,
+            storage=storage,
+            bot=bot,
+            i18n=i18n,
+            services=services_container,
+        )
 
-    # Create the dispatcher
-    dispatcher = Dispatcher(
-        db=db,
-        storage=storage,
-        config=config,
-        bot=bot,
-        services=services_container,
-        gateway_factory=gateway_factory,
-        redis=storage.redis,
-        i18n=i18n,
-    )
+        # Create the dispatcher
+        dispatcher = Dispatcher(
+            db=db,
+            storage=storage,
+            config=config,
+            bot=bot,
+            services=services_container,
+            gateway_factory=gateway_factory,
+            redis=storage.redis,
+            i18n=i18n,
+        )
 
-    # Register event handlers
-    dispatcher.startup.register(on_startup)
-    dispatcher.shutdown.register(on_shutdown)
+        # Register event handlers
+        dispatcher.startup.register(on_startup)
+        dispatcher.shutdown.register(on_shutdown)
 
-    # Enable Maintenance mode for developing # WARNING: remove before production
-    MaintenanceMiddleware.set_mode(False)
+        # Enable Maintenance mode for developing # WARNING: remove before production
+        MaintenanceMiddleware.set_mode(False)
 
-    # Register middlewares
-    middlewares.register(dispatcher=dispatcher, i18n=i18n, session=db.session)
+        # Register middlewares
+        middlewares.register(dispatcher=dispatcher, i18n=i18n, session=db.session)
 
-    # Register filters
-    filters.register(
-        dispatcher=dispatcher,
-        developer_id=config.bot.DEV_ID,
-        admins_ids=config.bot.ADMINS,
-    )
+        # Register filters
+        filters.register(
+            dispatcher=dispatcher,
+            developer_id=config.bot.DEV_ID,
+            admins_ids=config.bot.ADMINS,
+        )
 
-    # Include bot routers
-    routers.include(app=app, dispatcher=dispatcher)
+        # Include bot routers
+        routers.include(app=app, dispatcher=dispatcher)
 
-    # Set up bot commands
-    await commands.setup(bot)
+        # Set up bot commands
+        await commands.setup(bot)
 
-    # Set up webhook request handler
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dispatcher, bot=bot, secret_token=config.bot.WEBHOOK_SECRET,
-    )
-    webhook_requests_handler.register(app, path=TELEGRAM_WEBHOOK)
+        # Set up webhook request handler
+        webhook_requests_handler = SimpleRequestHandler(
+            dispatcher=dispatcher, bot=bot, secret_token=config.bot.WEBHOOK_SECRET,
+        )
+        webhook_requests_handler.register(app, path=TELEGRAM_WEBHOOK)
 
-    # Set up application and run
-    setup_application(app, dispatcher, bot=bot)
-    await _run_app(app, host=DEFAULT_BOT_HOST, port=config.bot.PORT)
+        # Set up application and run
+        setup_application(app, dispatcher, bot=bot)
+        await _run_app(app, host=DEFAULT_BOT_HOST, port=config.bot.PORT)
+    finally:
+        # Covers startup errors before aiohttp can emit its shutdown signal.
+        await services_container.server_pool.close()
 
 
 if __name__ == "__main__":

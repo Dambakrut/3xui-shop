@@ -1,6 +1,6 @@
 # 3x-ui 3.8.5 adapter foundation (Patch 6B.1)
 
-The `app.integrations.xui` package is a **read-only**, asynchronous HTTP client for the [MHSanaei/3x-ui v3.8.5](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5) API. Production panel version is reported as 3.8.5; Xray Core version is reported as 26.9.30. These tests use a local fake HTTP server, never the production panel. Shop provisioning still uses py3xui 0.3.2; this adapter is **not wired into VPNService or ServerPoolService**.
+The `app.integrations.xui` package is a **read-only**, asynchronous HTTP client for the [MHSanaei/3x-ui v3.8.5](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5) API. Production panel version is reported as 3.8.5; Xray Core version is reported as 26.9.30. These tests use local fakes, never the production panel. Shop read paths use this adapter as of Patch 6B.2a; write paths remain legacy py3xui 0.3.2.
 
 ## Authentication
 
@@ -8,7 +8,7 @@ The `app.integrations.xui` package is a **read-only**, asynchronous HTTP client 
 
 `XUIAuthMode.TOKEN` sends `Authorization: Bearer <token>` on read calls and never calls login. `authenticate()` only prepares this mode locally; token validity is determined by the first API response. [Backend scope allowlists](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/api.go) allow `monitor` to read `/server/status` but not inbound/client data. `node-sync` permits inbound list and some writes, but not all canonical client, traffic and link reads. An **admin-scope** token is therefore required for the adapter's complete read surface. No token creation or scope escalation is implemented.
 
-The `XUI_TOKEN` setting of the existing shop has legacy py3xui loginSecret semantics. It is not automatically interpreted as a Bearer token by this package. New adapter credentials are passed explicitly when instantiated; no production config wiring was added.
+The `XUI_TOKEN` setting of the existing shop has legacy py3xui loginSecret semantics. It is not interpreted as a Bearer token. Runtime config uses `XUI_AUTH_MODE=session` by default and requires `XUI_USERNAME`/`XUI_PASSWORD`. Explicit `XUI_AUTH_MODE=token` requires the separate `XUI_API_TOKEN` and does not require username/password. The runtime passes these credentials only to the matching adapter mode. A static two-factor code is not configured by the shop; a 2FA-enabled session account needs a separate approved strategy, or an appropriate API token.
 
 ## Read methods
 
@@ -17,7 +17,7 @@ All paths include the configured panel web base path. The method signatures live
 | Method | HTTP route | Result |
 |---|---|---|
 | `authenticate()` | GET `/csrf-token`, POST `/login` in session mode; no HTTP in token mode | Authenticated cookie+CSRF or configured Bearer mode |
-| `get_server_status()` | GET `/panel/api/server/status` | `XUIServerStatus(panel_version, xray_version)` |
+| `get_server_status()` | GET `/panel/api/server/status` | `XUIServerStatus(panel_version, xray_version, xray_state)` |
 | `list_inbounds()` | GET `/panel/api/inbounds/list` | Tuple of `XUIInboundSummary`, preserving all returned IDs and order |
 | `get_inbound(id)` | Filters `list_inbounds()` | Exact ID or `XUINotFoundError` |
 | `get_client(email)` | GET `/panel/api/clients/get/{email}` | `XUIClient` from `obj.client` and **all** `obj.inboundIds` |
@@ -42,4 +42,12 @@ Malformed JSON, malformed envelope, missing required objects and invalid typed f
 
 `tests/fixtures/xui/v3_8_5/` contains minimal synthetic envelopes derived from the checked [controllers](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go), [backend models](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/database/model/model.go), [traffic model](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/xray/client_traffic.go), [server status](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/server.go) and subscription link provider. They are not production captures. `tests/test_xui_adapter.py` drives a local aiohttp HTTP server to verify wire behavior and failure handling.
 
-6B.2 must separately switch ServerPoolService, add canonical client lookup and strict membership/ownership policy, implement modern add/update with preservation and ambiguous-write recovery, adapt renewal, and obtain the actual HTTP subscription URL from verified panel settings. No production write test is part of this foundation.
+## Runtime integration status (Patch 6B.2a)
+
+`ServerPoolService` owns one `XUIAdapter` and session per available server. Startup and refresh authenticate, read `/server/status`, require panel v3.8.5 and running Xray, then list inbounds. Provisioning eligibility requires the exact configured `XUI_INBOUND_ID` to exist, be enabled and have a known panel protocol. The typed inbound summary retains protocol, remark, tag and stream settings for the next patch. Failed candidates are closed immediately; refresh/removal closes old sessions; shutdown and startup failure paths close all remaining adapters. Modern authentication does not invoke py3xui login.
+
+`VPNService.is_client_exists`, `get_client_data` and `get_limit_ip` use canonical client lookup and membership from the adapter. The shop compares `User.vpn_id` only to canonical `client.uuid`; the numeric traffic row ID is never used for identity. Usage and expiry presentation come from the separate traffic response. Missing canonical client is reported as absent. Panel failures, mismatched UUID or missing configured membership are translated to a generic `VPNReadError` for purchase flows; the user-facing status read returns `None`, as before. A failed read must not be interpreted as a missing client by purchase logic.
+
+**Read path: modern 3x-ui 3.8.5 adapter. Write path: legacy py3xui, not modernized.** `create_client` and `update_client` retain their legacy py3xui add/update calls. They do not gain modern write support in 6B.2a. Their preconditions now use modern inbound/canonical checks where safely separable, but `update_client` still performs a legacy lookup solely to hydrate the old write model. The shop does not log py3xui in at startup: its 0.3.2 login is incompatible with v3.8.5 CSRF. On the target panel, legacy add/update therefore fail closed and cannot be considered operational provisioning. Token mode has no legacy write client at all. Do not sell or renew on this transitional branch until 6B.2b supplies modern writes and separately verifies them.
+
+6B.2b must implement modern add/update with exact inbound and ownership policy, preserve credentials and unrelated quota/reset/metadata fields, adapt renewal to canonical/traffic records, handle ambiguous side effects, and resolve the actual HTTP subscription URL from verified panel settings. No production write test is part of 6B.2a.

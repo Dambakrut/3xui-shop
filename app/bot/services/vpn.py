@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 
 import logging
 
-from py3xui import Client, Inbound
+from py3xui import Client
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ClientData
@@ -19,8 +19,13 @@ from app.bot.utils.time import (
 )
 from app.config import Config
 from app.db.models import Promocode, User
+from app.integrations.xui import XUIClient, XUIError, XUINotFoundError, validate_client_membership
 
 logger = logging.getLogger(__name__)
+
+
+class VPNReadError(RuntimeError):
+    """Generic service error for an unavailable or untrusted panel read."""
 
 
 class VPNService:
@@ -35,13 +40,29 @@ class VPNService:
         self.server_pool_service = server_pool_service
         logger.info("VPN Service initialized.")
 
-    async def is_client_exists(self, user: User) -> Client | None:
+    async def _read_owned_client(self, user: User, connection) -> XUIClient | None:
+        """Read canonical identity and membership; never trust traffic row ID."""
+        try:
+            client = await connection.adapter.get_client(str(user.tg_id))
+        except XUINotFoundError:
+            return None
+        except XUIError as exception:
+            raise VPNReadError("VPN client lookup unavailable") from exception
+        if client.uuid != user.vpn_id or client.email != str(user.tg_id):
+            raise VPNReadError("VPN client identity mismatch")
+        try:
+            validate_client_membership(client, self.config.xui.INBOUND_ID)
+        except XUIError as exception:
+            raise VPNReadError("VPN client is outside the configured inbound") from exception
+        return client
+
+    async def is_client_exists(self, user: User) -> XUIClient | None:
         connection = await self.server_pool_service.get_connection(user)
 
         if not connection:
             return None
 
-        client = await connection.api.client.get_by_email(str(user.tg_id))
+        client = await self._read_owned_client(user, connection)
 
         if client:
             logger.debug(f"Client {user.tg_id} exists on server {connection.server.name}.")
@@ -50,31 +71,17 @@ class VPNService:
 
         return client
 
-    async def get_limit_ip(self, user: User, client: Client) -> int | None:
-        connection = await self.server_pool_service.get_connection(user)
-
-        if not connection:
-            return None
-
+    async def get_limit_ip(self, user: User, client: XUIClient) -> int | None:
+        """Read configured client's IP limit from canonical data, never inbound order."""
         try:
-            inbounds: list[Inbound] = await connection.api.inbound.get_list()
-        except Exception as exception:
-            logger.error(f"Failed to fetch inbounds: {exception}")
+            if client.uuid != user.vpn_id or client.email != str(user.tg_id):
+                logger.error("VPN client identity mismatch for %s", user.tg_id)
+                return None
+            validate_client_membership(client, self.config.xui.INBOUND_ID)
+        except XUIError:
+            logger.error("Client %s is absent from configured inbound", user.tg_id)
             return None
-
-        if not isinstance(inbounds, list):
-            logger.error("3x-ui returned an invalid inbound list.")
-            return None
-        for inbound in inbounds:
-            if inbound.id != self.config.xui.INBOUND_ID:
-                continue
-            for inbound_client in inbound.settings.clients:
-                if inbound_client.email == client.email and inbound_client.id == user.vpn_id:
-                    logger.debug(f"Client {client.email} limit ip: {inbound_client.limit_ip}")
-                    return inbound_client.limit_ip
-
-        logger.critical(f"Client {client.email} not found in inbounds.")
-        return None
+        return client.limit_ip
 
     async def get_client_data(self, user: User) -> ClientData | None:
         logger.debug(f"Starting to retrieve client data for {user.tg_id}.")
@@ -85,7 +92,7 @@ class VPNService:
             return None
 
         try:
-            client = await connection.api.client.get_by_email(str(user.tg_id))
+            client = await self._read_owned_client(user, connection)
 
             if not client:
                 logger.critical(
@@ -93,25 +100,32 @@ class VPNService:
                 )
                 return None
 
+            traffic = await connection.adapter.get_client_traffic(str(user.tg_id))
+            if traffic is None:
+                logger.warning("No traffic row for client %s", user.tg_id)
+                return None
+
             limit_ip = await self.get_limit_ip(user=user, client=client)
+            if limit_ip is None:
+                return None
             max_devices = -1 if limit_ip == 0 else limit_ip
-            traffic_total = client.total
-            expiry_time = -1 if client.expiry_time == 0 else client.expiry_time
+            traffic_total = traffic.total
+            expiry_time = -1 if traffic.expiry_time_ms == 0 else traffic.expiry_time_ms
 
             if traffic_total <= 0:
                 traffic_remaining = -1
                 traffic_total = -1
             else:
-                traffic_remaining = client.total - (client.up + client.down)
+                traffic_remaining = traffic.total - (traffic.up + traffic.down)
 
-            traffic_used = client.up + client.down
+            traffic_used = traffic.up + traffic.down
             client_data = ClientData(
                 max_devices=max_devices,
                 traffic_total=traffic_total,
                 traffic_remaining=traffic_remaining,
                 traffic_used=traffic_used,
-                traffic_up=client.up,
-                traffic_down=client.down,
+                traffic_up=traffic.up,
+                traffic_down=traffic.down,
                 expiry_time=expiry_time,
             )
             logger.debug(f"Successfully retrieved client data for {user.tg_id}: {client_data}.")
@@ -157,7 +171,11 @@ class VPNService:
         if not connection:
             return False
 
-        if not await self.server_pool_service.validate_configured_inbound(connection.api):
+        if not await self.server_pool_service.validate_configured_inbound(connection.adapter):
+            return False
+
+        if connection.api is None:
+            logger.error("Legacy 3x-ui write client is unavailable")
             return False
 
         new_client = Client(
@@ -182,7 +200,7 @@ class VPNService:
             logger.info(f"Successfully created client for {user.tg_id}")
             return True
         except Exception as exception:
-            logger.error(f"Error creating client for {user.tg_id}: {exception}")
+            logger.error("Error creating client for %s (%s)", user.tg_id, type(exception).__name__)
             return False
 
     async def update_client(
@@ -203,19 +221,27 @@ class VPNService:
             return False
 
         try:
+            canonical = await self._read_owned_client(user, connection)
+            if canonical is None:
+                logger.error("Client %s not found for update", user.tg_id)
+                return False
+            current_device_limit = await self.get_limit_ip(user=user, client=canonical)
+            if current_device_limit is None:
+                return False
+            if connection.api is None:
+                logger.error("Legacy 3x-ui write client is unavailable")
+                return False
+
+            # Legacy py3xui read remains solely to hydrate its write model.
+            # v0.3.2 cannot update a 3x-ui 3.8.5 client; modern write is deferred.
             client = await connection.api.client.get_by_email(str(user.tg_id))
 
             if client is None:
                 logger.critical(f"Client {user.tg_id} not found for update.")
                 return False
 
-            if client.id != user.vpn_id:
-                logger.error(f"Client UUID mismatch for user {user.tg_id}; update refused.")
-                return False
-
-            current_device_limit = await self.get_limit_ip(user=user, client=client)
-            if current_device_limit is None:
-                logger.error(f"Client {user.tg_id} is absent from configured inbound; update refused.")
+            if client.inbound_id != self.config.xui.INBOUND_ID:
+                logger.error("Legacy client inbound mismatch for %s; update refused", user.tg_id)
                 return False
 
             if not replace_devices:
@@ -242,7 +268,7 @@ class VPNService:
             logger.info(f"Client {user.tg_id} updated successfully.")
             return True
         except Exception as exception:
-            logger.error(f"Error updating client {user.tg_id}: {exception}")
+            logger.error("Error updating client %s (%s)", user.tg_id, type(exception).__name__)
             return False
 
     async def create_subscription(self, user: User, devices: int, duration: int) -> bool:

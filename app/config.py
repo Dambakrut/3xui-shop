@@ -98,12 +98,14 @@ class ShopConfig:
 
 @dataclass
 class XUIConfig:
-    USERNAME: str
-    PASSWORD: str
-    TOKEN: str | None
+    USERNAME: str | None
+    PASSWORD: str | None = field(repr=False)
+    TOKEN: str | None = field(repr=False)
     INBOUND_ID: int
     SUBSCRIPTION_PORT: int
     SUBSCRIPTION_PATH: str
+    AUTH_MODE: str = "session"
+    API_TOKEN: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -192,6 +194,19 @@ def parse_xui_inbound_id(raw: str | None) -> int:
     return inbound_id
 
 
+def parse_xui_auth_mode(raw: str | None) -> str:
+    if raw not in ("session", "token"):
+        raise ValueError("XUI_AUTH_MODE must be 'session' or 'token'")
+    return raw
+
+
+def required_xui_credential(env: Env, name: str) -> str:
+    value = env.str(name, default=None)
+    if not value or not value.strip():
+        raise ValueError(f"{name} is required for the selected XUI_AUTH_MODE")
+    return value
+
+
 def validate_webhook_secret(secret: str | None) -> str:
     if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise ValueError("BOT_WEBHOOK_SECRET is required for webhook mode (1-256 letters, digits, _ or -)")
@@ -216,6 +231,14 @@ def load_config() -> Config:
     yoomoney_notification_secret = yoomoney_wallet_id = None
 
     inbound_id = parse_xui_inbound_id(env.str("XUI_INBOUND_ID", default=None))
+    xui_auth_mode = parse_xui_auth_mode(env.str("XUI_AUTH_MODE", default="session"))
+    if xui_auth_mode == "session":
+        xui_username = required_xui_credential(env, "XUI_USERNAME")
+        xui_password = required_xui_credential(env, "XUI_PASSWORD")
+        xui_api_token = None
+    else:
+        xui_username = xui_password = None
+        xui_api_token = required_xui_credential(env, "XUI_API_TOKEN")
     webhook_secret = validate_webhook_secret(env.str("BOT_WEBHOOK_SECRET", default=None))
     trusted_proxies = env.list("PAYMENT_TRUSTED_PROXY_NETWORKS", default=[])
     try:
@@ -228,8 +251,6 @@ def load_config() -> Config:
         logger.warning("BOT_ADMINS list is empty.")
 
     xui_token = env.str("XUI_TOKEN", default=None)
-    if not xui_token:
-        logger.warning("XUI_TOKEN is not set.")
 
     payment_stars_enabled = env.bool(
         "SHOP_PAYMENT_STARS_ENABLED",
@@ -367,8 +388,8 @@ def load_config() -> Config:
             PAYMENT_YOOMONEY_ENABLED=payment_yoomoney_enabled,
         ),
         xui=XUIConfig(
-            USERNAME=env.str("XUI_USERNAME"),
-            PASSWORD=env.str("XUI_PASSWORD"),
+            USERNAME=xui_username,
+            PASSWORD=xui_password,
             TOKEN=xui_token,
             INBOUND_ID=inbound_id,
             SUBSCRIPTION_PORT=env.int("XUI_SUBSCRIPTION_PORT", default=DEFAULT_SUBSCRIPTION_PORT),
@@ -376,6 +397,8 @@ def load_config() -> Config:
                 "XUI_SUBSCRIPTION_PATH",
                 default=DEFAULT_SUBSCRIPTION_PATH,
             ),
+            AUTH_MODE=xui_auth_mode,
+            API_TOKEN=xui_api_token,
         ),
         cryptomus=CryptomusConfig(
             API_KEY=cryptomus_api_key,

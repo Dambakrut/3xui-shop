@@ -181,14 +181,13 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from aiogram import Bot
         from py3xui import AsyncApi
+        from app.integrations.xui import XUIAdapter
         from app import __main__ as entry
         from app.config import load_config
         from app.db.database import Database
         from app.bot.services import plan
         from app.bot.payment_gateways import TelegramStars
         from app.db.models import Server
-
-        AsyncInbound = type(AsyncApi("https://panel.invalid", "dummy", "dummy").inbound)
 
         schedulers, databases, captured = [], [], {}
         original_start = AsyncIOScheduler.start
@@ -244,8 +243,12 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(entry, "_run_app", no_server_run))
             stack.enter_context(patch.object(AsyncIOScheduler, "start", paused_start))
             login = stack.enter_context(patch.object(AsyncApi, "login", new_callable=AsyncMock))
-            stack.enter_context(patch.object(AsyncInbound, "get_list", new=AsyncMock(
-                return_value=[SimpleNamespace(id=42)])))
+            adapter_login = stack.enter_context(patch.object(XUIAdapter, "authenticate", new_callable=AsyncMock))
+            stack.enter_context(patch.object(XUIAdapter, "get_server_status", new=AsyncMock(
+                return_value=SimpleNamespace(panel_version="v3.8.5", xray_state="running"))))
+            stack.enter_context(patch.object(XUIAdapter, "list_inbounds", new=AsyncMock(
+                return_value=[SimpleNamespace(id=42, enable=True, protocol="vless", remark="Shop")])) )
+            adapter_close = stack.enter_context(patch.object(XUIAdapter, "close", new_callable=AsyncMock))
             webhook = stack.enter_context(patch.object(Bot, "set_webhook", new_callable=AsyncMock))
             for method in ("set_my_commands", "delete_my_commands", "delete_webhook", "send_message"):
                 stack.enter_context(patch.object(Bot, method, new_callable=AsyncMock))
@@ -256,7 +259,9 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                side_effect=AssertionError("unexpected external network")))
             try:
                 await entry.main()
-                login.assert_awaited_once()
+                adapter_login.assert_awaited_once()
+                adapter_close.assert_awaited()
+                login.assert_not_awaited()
                 self.assertEqual(webhook.await_args.kwargs["secret_token"], "local_test_secret")
             finally:
                 for scheduler in schedulers:

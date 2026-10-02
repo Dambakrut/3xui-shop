@@ -112,14 +112,22 @@ class Py3xuiWireAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wire), 1)
         self.assertNotIn("totalGB", wire[0])  # zero default omitted, not a partial-update guarantee
 
-    async def test_actual_shop_update_refuses_numeric_traffic_id(self):
+    async def test_shop_read_uses_canonical_uuid_not_numeric_traffic_id(self):
         from app.bot.services.vpn import VPNService
-        self.reply["obj"] = {"id": 73, "uuid": UUID, "email": "123", "enable": True,
-                             "inboundId": 42}
-        pool = SimpleNamespace(get_connection=AsyncMock(return_value=SimpleNamespace(api=self.api)))
+        adapter = SimpleNamespace(
+            get_client=AsyncMock(return_value=SimpleNamespace(
+                record_id=73, uuid=UUID, email="123", inbound_ids=(42,), limit_ip=2)),
+            get_client_traffic=AsyncMock(return_value=SimpleNamespace(
+                id=14825, uuid=UUID, email="123", total=1000, up=64, down=128,
+                expiry_time_ms=1800000000000)),
+        )
+        pool = SimpleNamespace(get_connection=AsyncMock(return_value=SimpleNamespace(adapter=adapter, api=self.api)))
         service = VPNService(SimpleNamespace(xui=SimpleNamespace(INBOUND_ID=42)), None, pool)
-        self.assertFalse(await service.update_client(SimpleNamespace(tg_id=123, vpn_id=UUID), 2, 30))
-        self.assertEqual([r.method for r in self.requests], ["GET"])
+        result = await service.get_client_data(SimpleNamespace(tg_id=123, vpn_id=UUID, server_id=7))
+        self.assertIsNotNone(result)
+        self.assertEqual(result._traffic_used, 192)
+        self.assertEqual(result._max_devices, 2)
+        self.assertEqual(self.requests, [])  # No legacy traffic endpoint.
 
     async def test_unknown_metadata_is_not_preserved_by_client_model(self):
         from py3xui import Client

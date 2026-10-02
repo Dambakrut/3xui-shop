@@ -6,6 +6,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import Config
 from app.db.models import Server, User
+from app.integrations.xui import XUIAdapter, XUIAuthMode, XUIInboundSummary
+
+
+KNOWN_PROTOCOLS = frozenset({
+    "vmess", "vless", "trojan", "shadowsocks", "wireguard", "hysteria",
+    "http", "mixed", "tunnel", "tun", "mtproto", "amneziawg", "tuic",
+})
+TARGET_PANEL_VERSION = "3.8.5"
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +21,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Connection:
     server: Server
-    api: AsyncApi
+    adapter: XUIAdapter
+    api: AsyncApi | None  # Legacy write client; never used for modern reads.
 
 
 class ServerPoolService:
@@ -25,59 +34,94 @@ class ServerPoolService:
 
     async def _add_server(self, server: Server) -> None:
         if server.id not in self._servers:
-            api = AsyncApi(
-                host=server.host,
-                username=self.config.xui.USERNAME,
-                password=self.config.xui.PASSWORD,
-                token=self.config.xui.TOKEN,
-                # use_tls_verify=False,
-                logger=logging.getLogger(f"xui_{server.name}"),
-            )
+            adapter = None
             try:
-                await api.login()
-                server.online = await self.validate_configured_inbound(api)
+                mode = XUIAuthMode(getattr(self.config.xui, "AUTH_MODE", "session"))
+                adapter = XUIAdapter(
+                    server.host,
+                    auth_mode=mode,
+                    username=self.config.xui.USERNAME if mode is XUIAuthMode.SESSION else None,
+                    password=self.config.xui.PASSWORD if mode is XUIAuthMode.SESSION else None,
+                    token=getattr(self.config.xui, "API_TOKEN", None) if mode is XUIAuthMode.TOKEN else None,
+                )
+                await adapter.authenticate()
+                status = await adapter.get_server_status()
+                if status.panel_version.removeprefix("v") != TARGET_PANEL_VERSION:
+                    logger.error("Server %s has unsupported panel version %r", server.id, status.panel_version)
+                    server.online = False
+                elif status.xray_state != "running":
+                    logger.error("Server %s reports Xray state %r", server.id, status.xray_state)
+                    server.online = False
+                else:
+                    server.online = await self.validate_configured_inbound(adapter) is not None
                 if server.online:
-                    self._servers[server.id] = Connection(server=server, api=api)
-                    logger.info(f"Server {server.name} ({server.host}) added to pool successfully.")
+                    # py3xui stays for legacy writes. It is not logged in at startup:
+                    # v0.3.2 login is incompatible with 3x-ui 3.8.5 CSRF.
+                    api = (
+                        AsyncApi(
+                            host=server.host,
+                            username=self.config.xui.USERNAME,
+                            password=self.config.xui.PASSWORD,
+                            token=self.config.xui.TOKEN,
+                        )
+                        if mode is XUIAuthMode.SESSION else None
+                    )
+                    self._servers[server.id] = Connection(server=server, adapter=adapter, api=api)
+                    logger.info("Server %s available for read operations", server.id)
             except Exception as exception:
                 server.online = False
-                logger.error(f"Failed to add server {server.name} ({server.host}): {exception}")
+                logger.error("Server %s unavailable for reads (%s)", server.id, type(exception).__name__)
+            finally:
+                if adapter is not None and server.id not in self._servers:
+                    await adapter.close()
 
             async with self.session() as session:
                 await Server.update(session=session, name=server.name, online=server.online)
 
-    def _remove_server(self, server: Server) -> None:
-        if server.id in self._servers:
-            try:
-                del self._servers[server.id]
-            except Exception as exception:
-                logger.error(f"Failed to remove server {server.name}: {exception}")
+    async def _remove_server(self, server: Server) -> None:
+        connection = self._servers.pop(server.id, None)
+        if connection is not None:
+            await connection.adapter.close()
+
+    async def close(self) -> None:
+        """Release all per-server aiohttp sessions on shutdown or startup failure."""
+        connections = list(self._servers.values())
+        self._servers.clear()
+        for connection in connections:
+            await connection.adapter.close()
 
     async def refresh_server(self, server: Server) -> None:
         if server.id in self._servers:
-            self._remove_server(server)
+            await self._remove_server(server)
 
         await self._add_server(server)
-        logger.info(f"Server {server.name} reinitialized successfully.")
+        logger.info("Server %s refresh finished", server.id)
 
-    async def validate_configured_inbound(self, api: AsyncApi) -> bool:
+    async def validate_configured_inbound(self, adapter: XUIAdapter) -> XUIInboundSummary | None:
         try:
-            inbounds = await api.inbound.get_list()
+            inbounds = await adapter.list_inbounds()
         except Exception as exception:
-            logger.error(f"Failed to validate XUI_INBOUND_ID={self.config.xui.INBOUND_ID}: {exception}")
-            return False
-        if not isinstance(inbounds, list) or not all(
-            isinstance(getattr(inbound, "id", None), int) for inbound in inbounds
-        ):
-            logger.error("3x-ui returned an invalid inbound list; provisioning disabled.")
-            return False
-        if not any(inbound.id == self.config.xui.INBOUND_ID for inbound in inbounds):
-            logger.error(
-                f"XUI_INBOUND_ID={self.config.xui.INBOUND_ID} is absent from 3x-ui; "
-                "provisioning disabled."
+            logger.error("Inbound validation failed for server adapter (%s)", type(exception).__name__)
+            return None
+        if not isinstance(inbounds, (list, tuple)):
+            logger.error("Inbound validation received a malformed list")
+            return None
+        for inbound in inbounds:
+            if inbound.id != self.config.xui.INBOUND_ID:
+                continue
+            if not inbound.enable:
+                logger.error("Configured inbound %s is disabled", inbound.id)
+                return None
+            if inbound.protocol not in KNOWN_PROTOCOLS:
+                logger.error("Configured inbound %s has unknown protocol %r", inbound.id, inbound.protocol)
+                return None
+            logger.info(
+                "Validated inbound id=%s protocol=%r remark=%r",
+                inbound.id, inbound.protocol, inbound.remark[:80],
             )
-            return False
-        return True
+            return inbound
+        logger.error("Configured inbound %s is absent", self.config.xui.INBOUND_ID)
+        return None
 
     async def get_connection(self, user: User) -> Connection | None:
         if not user.server_id:
@@ -123,15 +167,17 @@ class ServerPoolService:
 
         for server_id in list(self._servers.keys()):
             if server_id not in db_server_map:
-                self._remove_server(self._servers[server_id].server)
+                await self._remove_server(self._servers[server_id].server)
 
+        refreshed_ids = set()
         for server_id, conn in list(self._servers.items()):
             if db_server := db_server_map.get(server_id):
                 conn.server = db_server
             await self.refresh_server(conn.server)
+            refreshed_ids.add(server_id)
 
         for server in db_servers:
-            if server.id not in self._servers:
+            if server.id not in self._servers and server.id not in refreshed_ids:
                 await self._add_server(server)
 
         logger.info(f"Sync complete. Currently active servers: {len(self._servers)}")
