@@ -1,0 +1,30 @@
+{
+  "audit_date": "2026-10-02",
+  "shop_branch": "feature/3xui-api-audit",
+  "shop_commit": "c9394e97e7a4484eca6ae6d2372711e0b9c0b730",
+  "py3xui_version": "0.3.2",
+  "upstream_tag": "v3.8.5",
+  "upstream_commit": "7ef22f94c950ff09f0870e2295fa65ad5968742c",
+  "production_panel_version": null,
+  "reported_xray_version": "26.9.30",
+  "live_panel_verified": false,
+  "path_prefix": "configured panel web base path",
+  "sources": [
+    "https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go",
+    "https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/inbound.go",
+    "https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/index.go",
+    "https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/database/model/model.go",
+    "https://pypi.org/project/py3xui/0.3.2/"
+  ],
+  "operations": [
+    {"operation": "login", "method": "POST", "legacy_path": "/login", "current_path": "/login", "status": "CHANGED", "action": "CSRF bootstrap/header; twoFactorCode or scoped Bearer API flow"},
+    {"operation": "inbound_list", "method": "GET", "legacy_path": "/panel/api/inbounds/list", "current_path": "/panel/api/inbounds/list", "status": "COMPATIBLE WITH CAVEAT", "action": "Fix auth; validate configured inbound protocol and security"},
+    {"operation": "traffic_lookup", "method": "GET", "legacy_path": "/panel/api/inbounds/getClientTraffics/{email}", "current_path": "/panel/api/clients/traffic/{email}", "status": "REMOVED", "action": "Separate statistics from canonical identity GET /panel/api/clients/get/{email}"},
+    {"operation": "add_client", "method": "POST", "legacy_path": "/panel/api/inbounds/addClient", "current_path": "/panel/api/clients/add", "status": "REMOVED", "action": "Use client object and explicit inboundIds array"},
+    {"operation": "update_client", "method": "POST", "legacy_path": "/panel/api/inbounds/updateClient/{uuid}", "current_path": "/panel/api/clients/update/{email}", "status": "REMOVED", "action": "Flat client body; verify ownership, UUID and shared membership before update"}
+  ],
+  "units": {"expiryTime": "UTC epoch milliseconds", "totalGB": "bytes", "token_expiresAt": "epoch seconds", "limitIp": "IP count"},
+  "sentinels": {"expiryTime_zero": "unlimited", "expiryTime_negative": "delayed start", "totalGB_zero": "unlimited"},
+  "identity": {"wire_client_id": "UUID string for VLESS/VMess", "record_id": "database integer", "record_uuid": "UUID string", "membership": "inboundIds association"},
+  "notes": "Source-derived audit only. Not a production compatibility certificate. See companion markdown for schemas, findings and limitations."
+}
