@@ -230,7 +230,7 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StarsDuplicateTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stars_creates_pending_and_accepts_duplicate_update(self):
+    async def test_stars_duplicate_routes_same_saved_order_without_creating_transaction(self):
         source = ROOT / "app/bot/routers/subscription/payment_handler.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         handler = next(
@@ -265,16 +265,17 @@ class StarsDuplicateTests(unittest.IsolatedAsyncioTestCase):
             async def __call__(self, user_id):
                 return False
 
-        gateway = SimpleNamespace(handle_payment_succeeded=AsyncMock())
+        gateway = SimpleNamespace(process_successful_payment=AsyncMock())
         namespace = dict(
             Transaction=FakeTransaction, TransactionStatus=Status,
             SubscriptionData=SimpleNamespace(unpack=lambda payload: data),
             IsDev=IsDev, NavSubscription=SimpleNamespace(PAY_TELEGRAM_STARS="stars"),
             logger=logging.getLogger("stars-duplicate-test"),
+            InvalidPayment=ValueError,
         )
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
-        payment = SimpleNamespace(invoice_payload="order-1", telegram_payment_charge_id="charge-1")
-        message = SimpleNamespace(successful_payment=payment)
+        payment = SimpleNamespace(invoice_payload="order-1", telegram_payment_charge_id="charge-1", total_amount=100, currency="XTR")
+        message = SimpleNamespace(successful_payment=payment, from_user=SimpleNamespace(id=123))
         factory = SimpleNamespace(get_gateway=lambda name: gateway)
         user = SimpleNamespace(tg_id=123)
         bot = SimpleNamespace(refund_star_payment=AsyncMock())
@@ -283,7 +284,10 @@ class StarsDuplicateTests(unittest.IsolatedAsyncioTestCase):
                 message=message, user=user, session=object(), bot=bot, gateway_factory=factory
             )
         self.assertEqual(transaction.status, Status.PENDING)
-        self.assertEqual(gateway.handle_payment_succeeded.await_count, 2)
+        self.assertEqual(records, {})  # The router cannot create a new transaction from untrusted payload.
+        self.assertEqual(gateway.process_successful_payment.await_count, 2)
+        for call in gateway.process_successful_payment.await_args_list:
+            self.assertEqual(call.args, ("order-1", 123, 100, "XTR", "charge-1"))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import re
+from ipaddress import ip_network
 from logging.handlers import MemoryHandler
 from pathlib import Path
 
@@ -63,6 +65,7 @@ logger.addHandler(memory_handler)
 @dataclass
 class BotConfig:
     TOKEN: str
+    WEBHOOK_SECRET: str = field(repr=False)
     ADMINS: list[int]
     DEV_ID: int
     SUPPORT_ID: int
@@ -171,6 +174,7 @@ class Config:
     database: DatabaseConfig
     redis: RedisConfig
     logging: LoggingConfig
+    PAYMENT_TRUSTED_PROXY_NETWORKS: list[str] = field(default_factory=list)
 
 
 def parse_xui_inbound_id(raw: str | None) -> int:
@@ -183,11 +187,23 @@ def parse_xui_inbound_id(raw: str | None) -> int:
     return inbound_id
 
 
+def validate_webhook_secret(secret: str | None) -> str:
+    if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        raise ValueError("BOT_WEBHOOK_SECRET is required for webhook mode (1-256 letters, digits, _ or -)")
+    return secret
+
+
 def load_config() -> Config:
     env = Env()
     env.read_env()
 
     inbound_id = parse_xui_inbound_id(env.str("XUI_INBOUND_ID", default=None))
+    webhook_secret = validate_webhook_secret(env.str("BOT_WEBHOOK_SECRET", default=None))
+    trusted_proxies = env.list("PAYMENT_TRUSTED_PROXY_NETWORKS", default=[])
+    try:
+        trusted_proxies = [str(ip_network(value)) for value in trusted_proxies]
+    except ValueError:
+        raise ValueError("PAYMENT_TRUSTED_PROXY_NETWORKS must contain valid IP addresses or CIDRs") from None
 
     bot_admins = env.list("BOT_ADMINS", subcast=int, default=[], required=False)
     if not bot_admins:
@@ -282,8 +298,10 @@ def load_config() -> Config:
         referrer_reward_enabled = False
 
     return Config(
+        PAYMENT_TRUSTED_PROXY_NETWORKS=trusted_proxies,
         bot=BotConfig(
             TOKEN=env.str("BOT_TOKEN"),
+            WEBHOOK_SECRET=webhook_secret,
             ADMINS=bot_admins,
             DEV_ID=env.int("BOT_DEV_ID"),
             SUPPORT_ID=env.int("BOT_SUPPORT_ID"),

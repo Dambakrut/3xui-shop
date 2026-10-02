@@ -7,13 +7,12 @@ from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
 from aiogram.utils.i18n import gettext as _
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.filters.is_dev import IsDev
 from app.bot.models import ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import GatewayFactory
-from app.bot.utils.constants import TransactionStatus
 from app.bot.utils.formatting import format_subscription_period
 from app.bot.utils.navigation import NavSubscription
-from app.db.models import Transaction, User
+from app.db.models import User
+from app.bot.utils.payment_security import InvalidPayment
 
 from .keyboard import pay_keyboard
 
@@ -35,8 +34,13 @@ async def callback_payment_method_selected(
     gateway_factory: GatewayFactory,
     state: FSMContext,
 ) -> None:
+    if (callback_data.user_id != user.tg_id or callback.from_user.id != user.tg_id
+        or callback_data.devices <= 0 or callback_data.duration <= 0
+        or (callback_data.is_extend and callback_data.is_change)):
+        logger.warning("Payment selection user mismatch.")
+        return
     if await state.get_state() == PaymentState.processing:
-        logger.debug(f"User {user.tg_id} is already processing payment.")
+        logger.debug("Payment selection is already being processed.")
         return
 
     await state.set_state(PaymentState.processing)
@@ -45,8 +49,7 @@ async def callback_payment_method_selected(
         method = callback_data.state
         devices = callback_data.devices
         duration = callback_data.duration
-        logger.info(f"User {user.tg_id} selected payment method: {method}")
-        logger.info(f"User {user.tg_id} selected {devices} devices and {duration} days.")
+        logger.info("Payment method selected: %s", method)
         gateway = gateway_factory.get_gateway(method)
         plan = services.plan.get_plan(devices)
         price = plan.get_price(currency=gateway.currency, duration=duration)
@@ -70,20 +73,32 @@ async def callback_payment_method_selected(
             ),
             reply_markup=pay_keyboard(pay_url=pay_url, callback_data=callback_data),
         )
-    except Exception as exception:
-        logger.error(f"Error processing payment: {exception}")
+    except Exception:
+        logger.error("Payment creation failed.")
         await services.notification.show_popup(callback=callback, text=_("payment:popup:error"))
     finally:
         await state.set_state(None)
 
 
 @router.pre_checkout_query()
-async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery, user: User) -> None:
-    logger.info(f"Pre-checkout query received from user {user.tg_id}")
-    if pre_checkout_query.invoice_payload:
+async def pre_checkout_handler(
+    pre_checkout_query: PreCheckoutQuery, user: User, gateway_factory: GatewayFactory
+) -> None:
+    try:
+        if pre_checkout_query.from_user.id != user.tg_id:
+            raise InvalidPayment("Stars user mismatch")
+        gateway = gateway_factory.get_gateway(NavSubscription.PAY_TELEGRAM_STARS)
+        await gateway.validate_checkout(
+            pre_checkout_query.invoice_payload, user.tg_id,
+            pre_checkout_query.total_amount, pre_checkout_query.currency,
+        )
         await pre_checkout_query.answer(ok=True)
-    else:
-        await pre_checkout_query.answer(ok=False)
+    except InvalidPayment:
+        logger.warning("Stars checkout validation failed.")
+        await pre_checkout_query.answer(ok=False, error_message="Invalid payment order.")
+    except Exception:
+        logger.error("Stars checkout temporarily unavailable.")
+        await pre_checkout_query.answer(ok=False, error_message="Payment temporarily unavailable.")
 
 
 @router.message(F.successful_payment)
@@ -94,27 +109,17 @@ async def successful_payment(
     bot: Bot,
     gateway_factory: GatewayFactory,
 ) -> None:
-    data = SubscriptionData.unpack(message.successful_payment.invoice_payload)
-    payment_id = message.successful_payment.telegram_payment_charge_id
-    transaction = await Transaction.create(
-        session=session,
-        tg_id=user.tg_id,
-        subscription=data.pack(),
-        payment_id=payment_id,
-        status=TransactionStatus.PENDING,
-    )
-
-    if transaction and await IsDev()(user_id=user.tg_id):
-        await bot.refund_star_payment(
-            user_id=user.tg_id,
-            telegram_payment_charge_id=payment_id,
+    try:
+        if message.from_user.id != user.tg_id:
+            raise InvalidPayment("Stars user mismatch")
+        payment = message.successful_payment
+        gateway = gateway_factory.get_gateway(NavSubscription.PAY_TELEGRAM_STARS)
+        await gateway.process_successful_payment(
+            payment.invoice_payload, user.tg_id, payment.total_amount,
+            payment.currency, payment.telegram_payment_charge_id,
         )
-
-    if not transaction:
-        transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
-    if not transaction or transaction.tg_id != user.tg_id or transaction.subscription != data.pack():
-        logger.error(f"Stars payment {payment_id} has no matching transaction.")
-        return
-
-    gateway = gateway_factory.get_gateway(NavSubscription.PAY_TELEGRAM_STARS)
-    await gateway.handle_payment_succeeded(payment_id=payment_id)
+    except InvalidPayment:
+        logger.warning("Stars successful payment validation failed.")
+    except Exception:
+        logger.error("Stars payment processing temporarily failed.")
+        raise RuntimeError("Stars payment processing temporarily failed") from None

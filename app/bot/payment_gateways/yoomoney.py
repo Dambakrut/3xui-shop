@@ -1,6 +1,8 @@
 import hashlib
+import hmac
 import logging
 import uuid
+from urllib.parse import quote
 
 import requests
 from aiogram import Bot
@@ -18,11 +20,13 @@ from app.bot.utils.formatting import format_device_count, format_subscription_pe
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
+from app.bot.utils.payment_security import InvalidPayment, money, payment_snapshot
 
 logger = logging.getLogger(__name__)
 
 
 class Yoomoney(PaymentGateway):
+    provider = "yoomoney"
     name = ""
     currency = Currency.RUB
     callback = NavSubscription.PAY_YOOMONEY
@@ -72,15 +76,18 @@ class Yoomoney(PaymentGateway):
         )
 
         async with self.session() as session:
-            await Transaction.create(
+            transaction = await Transaction.create(
                 session=session,
                 tg_id=data.user_id,
                 subscription=data.pack(),
                 payment_id=payment_id,
                 status=TransactionStatus.PENDING,
+                **payment_snapshot(self.provider, self.currency.code, price),
             )
+            if transaction is None:
+                raise RuntimeError("Could not persist YooMoney order")
 
-        logger.info(f"Payment link created for user {data.user_id}: {pay_url}")
+        logger.info("YooMoney payment link created.")
         return pay_url
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
@@ -90,21 +97,45 @@ class Yoomoney(PaymentGateway):
         await self._on_payment_canceled(payment_id)
 
     async def webhook_handler(self, request: Request) -> Response:
+        validated = False
         try:
             event_data = await request.post()
-            logger.debug(f"Parsed form data: {dict(event_data)}")
-
+            if len(event_data) != len(set(event_data.keys())):
+                return Response(status=400)
             if not self.verify_notification(event_data):
-                logger.error("YooMoney verification failed.")
+                logger.warning("YooMoney signature rejected.")
                 return Response(status=403)
-
-            logger.debug("YooMoney verified successfully.")
-            await self.handle_payment_succeeded(event_data.get("label"))
+            # Legacy SHA1 does not authenticate withdraw_amount or test flags.
+            if not event_data.get("sign"):
+                raise InvalidPayment("legacy signature cannot authenticate full payment")
+            if (event_data.get("notification_type") not in ("p2p-incoming", "card-incoming")
+                or event_data.get("codepro") != "false"
+                or event_data.get("unaccepted") != "false"
+                or event_data.get("test_notification", "false") != "false"
+                or event_data.get("currency") != "643"):
+                raise InvalidPayment("unsupported payment event")
+            money(event_data.get("amount"))
+            payment_id = event_data.get("label")
+            await self._get_verified_order(
+                payment_id, event_data.get("withdraw_amount"), self.currency.code,
+            )
+            async with self.session() as session:
+                if not await Transaction.bind_provider_payment_id(
+                    session, payment_id, event_data.get("operation_id")
+                ):
+                    raise InvalidPayment("operation identity mismatch")
+            validated = True
+            await self.handle_payment_succeeded(payment_id)
             return Response(status=200)
-
-        except Exception as exception:
-            logger.exception(f"Error processing YooMoney webhook: {exception}")
+        except (InvalidPayment, ValueError, TypeError, AttributeError):
+            if validated:
+                logger.error("YooMoney purchase processing temporarily failed.")
+                return Response(status=503)
+            logger.warning("YooMoney callback validation failed.")
             return Response(status=400)
+        except Exception:
+            logger.error("YooMoney callback temporarily failed.")
+            return Response(status=503)
 
     def create_quickpay_url(
         self,
@@ -137,6 +168,16 @@ class Yoomoney(PaymentGateway):
         return response.url
 
     def verify_notification(self, data: dict) -> bool:
+        secret = self.config.yoomoney.NOTIFICATION_SECRET
+        if not secret or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            return False
+        sign = data.get("sign")
+        if sign is not None:
+            canonical = "&".join(
+                f"{key}={quote(data[key], safe='~-._')}" for key in sorted(data) if key != "sign"
+            )
+            expected = hmac.new(secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected.encode(), sign.encode())
         params = [
             data.get("notification_type", ""),
             data.get("operation_id", ""),
@@ -152,10 +193,4 @@ class Yoomoney(PaymentGateway):
         sign_str = "&".join(params)
         computed_hash = hashlib.sha1(sign_str.encode("utf-8")).hexdigest()
 
-        is_valid = computed_hash == data.get("sha1_hash", "")
-        if not is_valid:
-            logger.warning(
-                f"Invalid signature. Expected {computed_hash}, received {data.get('sha1_hash')}."
-            )
-
-        return is_valid
+        return hmac.compare_digest(computed_hash.encode(), data.get("sha1_hash", "").encode())

@@ -36,6 +36,13 @@ class Transaction(Base):
     tg_id: Mapped[int] = mapped_column(ForeignKey("users.tg_id"), nullable=False)
     payment_id: Mapped[str] = mapped_column(String(length=64), unique=True, nullable=False)
     subscription: Mapped[str] = mapped_column(String(length=255), nullable=False)
+    payment_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expected_amount: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("payment_provider", "provider_payment_id", name="uq_provider_payment"),
+    )
     status: Mapped[TransactionStatus] = mapped_column(
         Enum(TransactionStatus, values_callable=lambda obj: [e.value for e in obj]),
         nullable=False,
@@ -88,8 +95,31 @@ class Transaction(Base):
             return transaction
         except IntegrityError as exception:
             await session.rollback()
-            logger.error(f"Error occurred while creating transaction {payment_id}: {exception}")
+            logger.error("Could not create transaction (integrity conflict).")
             return None
+
+    @classmethod
+    async def bind_provider_payment_id(
+        cls, session: AsyncSession, payment_id: str, provider_id: str, only_if_unbound: bool = False
+    ) -> bool:
+        if not isinstance(provider_id, str) or not provider_id or len(provider_id) > 128:
+            return False
+        try:
+            result = await session.execute(
+                update(cls).where(
+                    cls.payment_id == payment_id, cls.provider_payment_id.is_(None),
+                ).values(provider_payment_id=provider_id).execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            if result.rowcount == 1:
+                return True
+            if only_if_unbound:
+                return False
+            bound_id = await session.scalar(select(cls.provider_payment_id).where(cls.payment_id == payment_id))
+            return bound_id == provider_id
+        except IntegrityError:
+            await session.rollback()
+            return False
 
     @classmethod
     async def update(cls, session: AsyncSession, payment_id: str, **kwargs: Any) -> Self | None:

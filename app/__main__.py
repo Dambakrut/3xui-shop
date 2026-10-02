@@ -48,8 +48,8 @@ async def on_startup(
 ) -> None:
     webhook_url = urljoin(config.bot.DOMAIN, TELEGRAM_WEBHOOK)
 
-    if await bot.get_webhook_info() != webhook_url:
-        await bot.set_webhook(webhook_url)
+    # Re-register on every start: Telegram does not expose the current secret.
+    await bot.set_webhook(webhook_url, secret_token=config.bot.WEBHOOK_SECRET)
 
     current_webhook = await bot.get_webhook_info()
     logging.info(f"Current webhook URL: {current_webhook.url}")
@@ -163,7 +163,9 @@ async def main() -> None:
     await commands.setup(bot)
 
     # Set up webhook request handler
-    webhook_requests_handler = SimpleRequestHandler(dispatcher=dispatcher, bot=bot)
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dispatcher, bot=bot, secret_token=config.bot.WEBHOOK_SECRET,
+    )
     webhook_requests_handler.register(app, path=TELEGRAM_WEBHOOK)
 
     # Set up application and run

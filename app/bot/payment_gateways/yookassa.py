@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 from aiogram import Bot
 from aiogram.fsm.storage.redis import RedisStorage
@@ -8,13 +9,8 @@ from aiogram.utils.i18n import lazy_gettext as __
 from aiohttp.web import Application, Request, Response
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from yookassa import Configuration, Payment
-from yookassa.domain.common import SecurityHelper
 from yookassa.domain.common.confirmation_type import ConfirmationType
 from yookassa.domain.models.receipt import Receipt, ReceiptItem
-from yookassa.domain.notification import (
-    WebhookNotificationEventType,
-    WebhookNotificationFactory,
-)
 from yookassa.domain.request.payment_request import PaymentRequest
 
 from app.bot.models import ServicesContainer, SubscriptionData
@@ -24,11 +20,13 @@ from app.bot.utils.formatting import format_device_count, format_subscription_pe
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
+from app.bot.utils.payment_security import InvalidPayment, payment_snapshot
 
 logger = logging.getLogger(__name__)
 
 
 class Yookassa(PaymentGateway):
+    provider = "yookassa"
     name = ""
     currency = Currency.RUB
     callback = NavSubscription.PAY_YOOKASSA
@@ -86,21 +84,25 @@ class Yookassa(PaymentGateway):
             save_payment_method=False,
             description=description,
             receipt=receipt,
+            metadata={"tg_id": str(data.user_id), "subscription": data.pack()},
         )
 
-        response = Payment.create(request)
+        response = await asyncio.to_thread(Payment.create, request)
 
         async with self.session() as session:
-            await Transaction.create(
+            transaction = await Transaction.create(
                 session=session,
                 tg_id=data.user_id,
                 subscription=data.pack(),
                 payment_id=response.id,
                 status=TransactionStatus.PENDING,
+                **payment_snapshot(self.provider, self.currency.code, price, response.id),
             )
+            if transaction is None:
+                raise RuntimeError("Could not persist YooKassa order")
 
         pay_url = response.confirmation["confirmation_url"]
-        logger.info(f"Payment link created for user {data.user_id}: {pay_url}")
+        logger.info("YooKassa payment link created.")
         return pay_url
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
@@ -110,29 +112,47 @@ class Yookassa(PaymentGateway):
         await self._on_payment_canceled(payment_id)
 
     async def webhook_handler(self, request: Request) -> Response:
-        ip = request.headers.get("X-Forwarded-For", request.remote)
-
-        if not SecurityHelper().is_ip_trusted(ip):
-            return Response(status=403)
-
+        validated = False
         try:
             event_json = await request.json()
-            notification_object = WebhookNotificationFactory().create(event_json)
-            response_object = notification_object.object
-            payment_id = response_object.id
-
-            match notification_object.event:
-                case WebhookNotificationEventType.PAYMENT_SUCCEEDED:
-                    await self.handle_payment_succeeded(payment_id)
-                    return Response(status=200)
-
-                case WebhookNotificationEventType.PAYMENT_CANCELED:
-                    await self.handle_payment_canceled(payment_id)
-                    return Response(status=200)
-
-                case _:
-                    return Response(status=400)
-
-        except Exception as exception:
-            logger.exception(f"Error processing YooKassa webhook: {exception}")
+            payment_id = event_json.get("object", {}).get("id")
+            event = event_json.get("event")
+            if event not in ("payment.succeeded", "payment.canceled"):
+                raise InvalidPayment("unsupported event")
+            # Reject unknown IDs before an API lookup; headers are never identity evidence.
+            if not isinstance(payment_id, str) or not payment_id or len(payment_id) > 64:
+                raise InvalidPayment("invalid ID")
+            async with self.session() as session:
+                saved = await Transaction.get_by_id(session, payment_id)
+            if saved is None or saved.payment_provider != self.provider:
+                raise InvalidPayment("unknown order")
+            payment = await asyncio.to_thread(Payment.find_one, payment_id)
+            if payment.id != payment_id:
+                raise InvalidPayment("payment identity mismatch")
+            transaction = await self._get_verified_order(
+                payment_id, payment.amount.value, payment.amount.currency, payment.id,
+            )
+            metadata = payment.metadata or {}
+            if (metadata.get("tg_id") != str(transaction.tg_id)
+                or metadata.get("subscription") != transaction.subscription):
+                raise InvalidPayment("metadata mismatch")
+            if event == "payment.succeeded":
+                if payment.status != "succeeded" or payment.paid is not True:
+                    raise InvalidPayment("payment not captured")
+                validated = True
+                await self.handle_payment_succeeded(payment_id)
+            else:
+                if payment.status != "canceled" or payment.paid is True:
+                    raise InvalidPayment("payment not canceled")
+                validated = True
+                await self.handle_payment_canceled(payment_id)
+            return Response(status=200)
+        except (InvalidPayment, ValueError, TypeError, AttributeError):
+            if validated:
+                logger.error("YooKassa purchase processing temporarily failed.")
+                return Response(status=503)
+            logger.warning("YooKassa callback validation failed.")
             return Response(status=400)
+        except Exception:
+            logger.error("YooKassa payment verification temporarily failed.")
+            return Response(status=503)

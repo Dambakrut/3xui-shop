@@ -23,6 +23,7 @@ from app.bot.utils.constants import (
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.config import Config
 from app.db.models import Transaction, User
+from app.bot.utils.payment_security import InvalidPayment, validate_order
 
 logger = logging.getLogger(__name__)
 _payment_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
@@ -74,6 +75,20 @@ class PaymentGateway(ABC):
     async def handle_payment_canceled(self, payment_id: str) -> None:
         pass
 
+    async def _get_verified_order(self, payment_id, amount, currency, provider_payment_id=None):
+        if not isinstance(payment_id, str) or not payment_id or len(payment_id) > 64:
+            raise InvalidPayment("invalid order ID")
+        async with self.session() as session:
+            transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
+        if transaction is None:
+            raise InvalidPayment("unknown order")
+        try:
+            data = SubscriptionData.unpack(transaction.subscription)
+        except (ValueError, TypeError):
+            raise InvalidPayment("invalid saved subscription") from None
+        validate_order(transaction, data, self.provider, self.callback, amount, currency, provider_payment_id)
+        return transaction
+
     async def _on_payment_succeeded(self, payment_id: str) -> None:
         logger.info(f"Payment succeeded {payment_id}")
 
@@ -121,7 +136,7 @@ class PaymentGateway(ABC):
                         user=user, devices=data.devices, duration=data.duration
                     )
             except Exception:
-                logger.exception("VPN provisioning raised for payment %s; reconciliation required.", payment_id)
+                logger.error("VPN provisioning raised for payment %s; reconciliation required.", payment_id)
                 provisioned = False
 
             if not provisioned:
@@ -138,7 +153,7 @@ class PaymentGateway(ABC):
                             "inspect its current state.", payment_id
                         )
                 except Exception:
-                    logger.exception(
+                    logger.error(
                         "Could not mark payment %s for review; stale PROCESSING recovery is required.",
                         payment_id,
                     )
@@ -151,7 +166,7 @@ class PaymentGateway(ABC):
                         session=session, payment_id=payment_id, status=TransactionStatus.COMPLETED
                     )
             except Exception:
-                logger.exception(
+                logger.error(
                     "VPN provisioning succeeded for payment %s, but DB completion failed; "
                     "manual reconciliation is required.", payment_id
                 )
@@ -162,7 +177,7 @@ class PaymentGateway(ABC):
                             status=TransactionStatus.REVIEW_REQUIRED,
                         )
                 except Exception:
-                    logger.exception(
+                    logger.error(
                         "Could not mark payment %s for review after DB completion failure; "
                         "stale PROCESSING recovery is required.", payment_id
                     )
@@ -203,19 +218,19 @@ class PaymentGateway(ABC):
             )
 
             if data.is_extend:
-                logger.info(f"Subscription extended for user {user.tg_id}")
+                logger.info("Subscription extended for payment %s", payment_id)
                 await self.services.notification.notify_extend_success(
                     user_id=user.tg_id,
                     data=data,
                 )
             elif data.is_change:
-                logger.info(f"Subscription changed for user {user.tg_id}")
+                logger.info("Subscription changed for payment %s", payment_id)
                 await self.services.notification.notify_change_success(
                     user_id=user.tg_id,
                     data=data,
                 )
             else:
-                logger.info(f"Subscription created for user {user.tg_id}")
+                logger.info("Subscription created for payment %s", payment_id)
                 key = await self.services.vpn.get_key(user)
                 await self.services.notification.notify_purchase_success(
                     user_id=user.tg_id,

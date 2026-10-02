@@ -20,11 +20,13 @@ from app.bot.utils.constants import CRYPTOMUS_WEBHOOK, Currency, TransactionStat
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
+from app.bot.utils.payment_security import InvalidPayment, payment_snapshot, safe_client_ip
 
 logger = logging.getLogger(__name__)
 
 
 class Cryptomus(PaymentGateway):
+    provider = "cryptomus"
     name = ""
     currency = Currency.USD
     callback = NavSubscription.PAY_CRYPTOMUS
@@ -66,6 +68,7 @@ class Cryptomus(PaymentGateway):
             "url_callback": self.config.bot.DOMAIN + CRYPTOMUS_WEBHOOK,
             "lifetime": 1800,
             "is_payment_multiple": False,
+            "additional_data": str(data.user_id),
         }
         headers = {
             "merchant": self.config.cryptomus.MERCHANT_ID,
@@ -80,18 +83,24 @@ class Cryptomus(PaymentGateway):
                 if response.status == 200 and result.get("result", {}).get("url"):
                     pay_url = result["result"]["url"]
                 else:
-                    raise Exception(f"Error: {response.status}; Result: {result}; Data: {data}")
+                    raise RuntimeError("Cryptomus invoice creation failed")
+        invoice = result["result"]
+        if invoice.get("order_id") != order_id or not invoice.get("uuid"):
+            raise RuntimeError("Cryptomus invoice identity mismatch")
 
         async with self.session() as session:
-            await Transaction.create(
+            transaction = await Transaction.create(
                 session=session,
                 tg_id=data.user_id,
                 subscription=data.pack(),
                 payment_id=result["result"]["order_id"],
                 status=TransactionStatus.PENDING,
+                **payment_snapshot(self.provider, self.currency.code, price, invoice["uuid"]),
             )
+            if transaction is None:
+                raise RuntimeError("Could not persist Cryptomus order")
 
-        logger.info(f"Payment link created for user {data.user_id}: {pay_url}")
+        logger.info("Cryptomus payment link created.")
         return pay_url
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
@@ -101,51 +110,69 @@ class Cryptomus(PaymentGateway):
         await self._on_payment_canceled(payment_id)
 
     async def webhook_handler(self, request: Request) -> Response:
+        validated = False
         logger.debug(f"Received Cryptomus webhook request")
         try:
             event_json = await request.json()
 
             if not self.verify_webhook(request, event_json):
                 return Response(status=403)
+            order_id = event_json.get("order_id")
+            if (event_json.get("type") != "payment"
+                or event_json.get("is_final") is not True
+                or not isinstance(event_json.get("uuid"), str)):
+                raise InvalidPayment("invalid payment event")
+            transaction = await self._get_verified_order(
+                order_id, event_json.get("amount"), event_json.get("currency"), event_json["uuid"],
+            )
+            if event_json.get("additional_data") != str(transaction.tg_id):
+                raise InvalidPayment("order metadata mismatch")
+            if "merchant" in event_json and event_json["merchant"] != self.config.cryptomus.MERCHANT_ID:
+                raise InvalidPayment("merchant mismatch")
 
             match event_json.get("status"):
                 case "paid" | "paid_over":
                     order_id = event_json.get("order_id")
+                    validated = True
                     await self.handle_payment_succeeded(order_id)
                     return Response(status=200)
 
                 case "cancel":
                     order_id = event_json.get("order_id")
+                    validated = True
                     await self.handle_payment_canceled(order_id)
                     return Response(status=200)
 
                 case _:
                     return Response(status=400)
 
-        except Exception as exception:
-            logger.exception(f"Error processing Cryptomus webhook: {exception}")
+        except (InvalidPayment, ValueError, TypeError, AttributeError):
+            if validated:
+                logger.error("Cryptomus purchase processing temporarily failed.")
+                return Response(status=503)
+            logger.warning("Cryptomus callback validation failed.")
             return Response(status=400)
+        except Exception:
+            logger.error("Cryptomus callback temporarily failed.")
+            return Response(status=503)
 
     def verify_webhook(self, request: Request, data: dict) -> bool:
-        client_ip = (
-            request.headers.get("CF-Connecting-IP")
-            or request.headers.get("X-Real-IP")
-            or request.headers.get("X-Forwarded-For")
-            or request.remote
-        )
+        if not isinstance(data, dict) or not self.config.cryptomus.API_KEY:
+            return False
+        client_ip = safe_client_ip(request.remote, request.headers, getattr(self.config, "PAYMENT_TRUSTED_PROXY_NETWORKS", ()))
         if client_ip not in ["91.227.144.54"]:
-            logger.warning(f"Unauthorized IP: {client_ip}")
+            logger.warning("Cryptomus source rejected.")
             return False
 
-        sign = data.pop("sign", None)
-        if not sign:
+        sign = data.get("sign")
+        if not isinstance(sign, str) or len(sign) != 32:
             logger.warning("Missing signature.")
             return False
 
-        json_data = json.dumps(data, separators=(",", ":"))
+        json_data = json.dumps({k: v for k, v in data.items() if k != "sign"}, ensure_ascii=False, separators=(",", ":")).replace("/", "\\/")
         hash_value = self.generate_signature(json_data)
 
-        if not compare_digest(hash_value, sign):
+        if not compare_digest(hash_value.encode(), sign.encode()):
             logger.warning(f"Invalid signature.")
             return False
 

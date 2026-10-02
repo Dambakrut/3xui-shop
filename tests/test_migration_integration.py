@@ -27,6 +27,7 @@ else:
 
 PREVIOUS_HEAD = "032f2bef8d8d"
 NEW_HEAD = "b6d4e8a72c13"
+SECURITY_HEAD = "c4e91b2a70d5"
 
 
 @unittest.skipUnless(DB_DEPENDENCIES_AVAILABLE, "Install DB dependencies for integration tests")
@@ -48,15 +49,58 @@ class MigrationIntegrationTests(unittest.TestCase):
         engine = sa.create_engine(f"sqlite:///{self.db_path.as_posix()}")
         try:
             with sa.orm.Session(engine) as session:
-                return {row.payment_id: row.status for row in session.scalars(sa.select(Transaction))}
+                # Older revisions intentionally do not contain the newer payment snapshot columns.
+                return dict(session.execute(sa.select(Transaction.payment_id, Transaction.status)).all())
         finally:
             engine.dispose()
 
     def test_revision_graph_has_one_head(self):
         script = ScriptDirectory.from_config(self.alembic_config)
-        self.assertEqual(script.get_heads(), [NEW_HEAD])
+        self.assertEqual(script.get_heads(), [SECURITY_HEAD])
+        self.assertEqual(script.get_revision(SECURITY_HEAD).down_revision, NEW_HEAD)
         self.assertEqual(script.get_revision(NEW_HEAD).down_revision, PREVIOUS_HEAD)
         self.assertEqual(script.get_revision(PREVIOUS_HEAD).down_revision, "579d48dd94ef")
+
+    def test_security_snapshot_migration_preserves_legacy_and_unique_identity(self):
+        self.run_migration(command.upgrade, NEW_HEAD)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "INSERT INTO users (tg_id, vpn_id, first_name, language_code, created_at, is_trial_used) "
+                "VALUES (123, 'vpn-123', 'Test', 'en', CURRENT_TIMESTAMP, 0)"
+            )
+            connection.execute(
+                "INSERT INTO transactions (tg_id, payment_id, subscription, status, created_at, updated_at) "
+                "VALUES (123, 'legacy', 'plan', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+            connection.commit()
+        self.run_migration(command.upgrade, SECURITY_HEAD)
+        engine = sa.create_engine(f"sqlite:///{self.db_path.as_posix()}")
+        try:
+            with sa.orm.Session(engine) as session:
+                inspector = sa.inspect(engine)
+                self.assertTrue(any(item["column_names"] == ["payment_id"]
+                    for item in inspector.get_unique_constraints("transactions")))
+                self.assertTrue(any(item["referred_table"] == "users"
+                    for item in inspector.get_foreign_keys("transactions")))
+                legacy = session.scalar(sa.select(Transaction))
+                self.assertEqual(legacy.payment_id, "legacy")
+                self.assertIsNone(legacy.expected_amount)
+                session.add(Transaction(tg_id=123, payment_id="new-order", subscription="plan",
+                    status=TransactionStatus.PENDING, payment_provider="stars", expected_amount="1",
+                    expected_currency="XTR", provider_payment_id="charge-1"))
+                session.commit()
+                session.add(Transaction(tg_id=123, payment_id="other-order", subscription="plan",
+                    status=TransactionStatus.PENDING, payment_provider="stars", expected_amount="1",
+                    expected_currency="XTR", provider_payment_id="charge-1"))
+                with self.assertRaises(sa.exc.IntegrityError):
+                    session.commit()
+                session.rollback()
+                session.execute(sa.delete(Transaction).where(Transaction.payment_id == "new-order"))
+                session.commit()
+        finally:
+            engine.dispose()
+        self.run_migration(command.downgrade, NEW_HEAD)
+        self.assertEqual(self.read_statuses(), {"legacy": TransactionStatus.PENDING})
 
     def test_upgrade_preserves_rows_constraints_and_clean_downgrade(self):
         self.run_migration(command.upgrade, PREVIOUS_HEAD)
@@ -166,6 +210,44 @@ class MigrationIntegrationTests(unittest.TestCase):
 
 @unittest.skipUnless(DB_DEPENDENCIES_AVAILABLE, "Install DB dependencies for integration tests")
 class RealClaimIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_id_binding_is_unique_and_duplicate_does_not_refresh_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = create_async_engine(f"sqlite+aiosqlite:///{(Path(directory) / 'binding.sqlite3').as_posix()}")
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(Transaction.metadata.create_all)
+                sessions = async_sessionmaker(engine, expire_on_commit=False)
+                async with sessions() as session:
+                    await session.execute(sa.text(
+                        "INSERT INTO users (tg_id, vpn_id, first_name, language_code, created_at, is_trial_used) "
+                        "VALUES (123, 'vpn-123', 'Test', 'en', CURRENT_TIMESTAMP, 0)"
+                    ))
+                    for order_id in ("one", "two"):
+                        session.add(Transaction(tg_id=123, payment_id=order_id, subscription="plan",
+                            status=TransactionStatus.PENDING, payment_provider="stars",
+                            expected_amount="1", expected_currency="XTR"))
+                    await session.commit()
+                    self.assertTrue(await Transaction.bind_provider_payment_id(session, "one", "charge-1"))
+                    self.assertFalse(await Transaction.bind_provider_payment_id(session, "two", "charge-1"))
+                    await session.execute(sa.text(
+                        "UPDATE transactions SET status='processing', updated_at='2000-01-01 00:00:00' WHERE payment_id='one'"
+                    ))
+                    await session.commit()
+                async with sessions() as session:
+                    self.assertTrue(await Transaction.bind_provider_payment_id(session, "one", "charge-1"))
+                    self.assertFalse(await Transaction.bind_provider_payment_id(session, "one", "charge-1", only_if_unbound=True))
+                    row = await Transaction.get_by_id(session, "one")
+                    self.assertEqual(row.updated_at.year, 2000)
+                    self.assertEqual(row.status, TransactionStatus.PROCESSING)
+                async with sessions() as stale_session:
+                    stale = await Transaction.get_by_id(stale_session, "two")
+                    self.assertIsNone(stale.provider_payment_id)
+                    async with sessions() as other_session:
+                        self.assertTrue(await Transaction.bind_provider_payment_id(other_session, "two", "charge-2"))
+                    self.assertFalse(await Transaction.bind_provider_payment_id(stale_session, "two", "wrong-charge"))
+            finally:
+                await engine.dispose()
+
     async def test_two_sessions_claim_once(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "claim.sqlite3"

@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 from aiogram import Bot
 from aiogram.fsm.storage.redis import RedisStorage
@@ -12,15 +13,18 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.bot.filters.is_dev import IsDev
 from app.bot.models import ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import PaymentGateway
-from app.bot.utils.constants import Currency
+from app.bot.utils.constants import Currency, TransactionStatus
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
+from app.db.models import Transaction
+from app.bot.utils.payment_security import InvalidPayment, payment_snapshot
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramStars(PaymentGateway):
+    provider = "stars"
     name = ""
     currency = Currency.XTR
     callback = NavSubscription.PAY_TELEGRAM_STARS
@@ -50,6 +54,17 @@ class TelegramStars(PaymentGateway):
             amount = 1
         else:
             amount = int(data.price)
+        if amount <= 0:
+            raise InvalidPayment("invalid Stars invoice amount")
+        order_id = str(uuid.uuid4())
+        async with self.session() as session:
+            transaction = await Transaction.create(
+                session=session, tg_id=data.user_id, subscription=data.pack(),
+                payment_id=order_id, status=TransactionStatus.PENDING,
+                **payment_snapshot(self.provider, self.currency.code, amount),
+            )
+            if transaction is None:
+                raise RuntimeError("Could not persist Stars order")
 
         prices = [LabeledPrice(label=self.currency.code, amount=amount)]
         devices = format_device_count(data.devices)
@@ -60,11 +75,40 @@ class TelegramStars(PaymentGateway):
             title=title,
             description=description,
             prices=prices,
-            payload=data.pack(),
+            payload=order_id,
             currency=self.currency.code,
         )
-        logger.info(f"Payment link created for user {data.user_id}: {pay_url}")
+        logger.info("Stars payment link created.")
         return pay_url
+
+    async def validate_checkout(self, order_id, user_id, amount, currency):
+        if currency != "XTR" or type(amount) is not int:
+            raise InvalidPayment("invalid Stars currency or amount")
+        transaction = await self._get_verified_order(order_id, amount, currency)
+        if transaction.tg_id != user_id or transaction.status != TransactionStatus.PENDING:
+            raise InvalidPayment("invalid Stars checkout order")
+        return transaction
+
+    async def process_successful_payment(self, order_id, user_id, amount, currency, charge_id):
+        if currency != "XTR" or type(amount) is not int or not isinstance(charge_id, str) or not charge_id:
+            raise InvalidPayment("invalid Stars payment")
+        transaction = await self._get_verified_order(order_id, amount, currency)
+        if transaction.tg_id != user_id:
+            raise InvalidPayment("Stars user mismatch")
+        async with self.session() as session:
+            first_delivery = await Transaction.bind_provider_payment_id(
+                session, order_id, charge_id, only_if_unbound=True,
+            )
+            if not first_delivery:
+                transaction = await Transaction.get_by_id(session, order_id)
+                if transaction is None or transaction.provider_payment_id != charge_id:
+                    raise InvalidPayment("Stars charge identity mismatch")
+        if first_delivery and await IsDev()(user_id=user_id):
+            try:
+                await self.bot.refund_star_payment(user_id=user_id, telegram_payment_charge_id=charge_id)
+            except Exception:
+                logger.error("Stars developer refund failed; manual review required.")
+        await self.handle_payment_succeeded(order_id)
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
         await self._on_payment_succeeded(payment_id)
