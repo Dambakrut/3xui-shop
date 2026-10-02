@@ -70,7 +70,19 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
                     return web.json_response({"success": False, "msg": "partial failure", "obj": None})
                 if self.post_behavior == "null_obj":
                     return web.json_response({"success": True, "obj": None})
-                return web.json_response({"success": True, "obj": {"nodePending": self.pending}})
+                if self.post_behavior == "unknown_obj":
+                    return web.json_response({"success": True, "obj": {}})
+                if self.post_behavior == "invalid_pending":
+                    return web.json_response({"success": True, "obj": {"nodePending": "secret"}})
+                if self.post_behavior == "other_obj":
+                    return web.json_response({"success": True, "obj": []})
+                if self.post_behavior == "explicit_false":
+                    return web.json_response({"success": True, "obj": {"nodePending": False}})
+                if self.post_behavior == "missing_obj":
+                    return web.json_response({"success": True})
+                if self.post_behavior == "invalid_envelope":
+                    return web.json_response({"success": "true", "obj": None})
+                return web.json_response({"success": True, "obj": {"nodePending": True} if self.pending else None})
             return web.Response(status=404)
 
         self.app = web.Application()
@@ -196,7 +208,7 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.client.expiry_time_ms, desired.expiry_time_ms)
         self.assertEqual(self.posts, [])
 
-    async def test_success_null_obj_confirms_persistence_not_activation(self):
+    async def test_success_null_obj_confirms_no_pending_work_add_and_update(self):
         from app.integrations.xui import XUIClientWrite
 
         self.post_behavior = "null_obj"
@@ -217,7 +229,9 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
                     )
                     result = await adapter.update_client(current, desired)
                 self.assertTrue(result.reconciled)
-                self.assertIsNone(result.node_pending)
+                self.assertIs(result.node_pending, False)
+                self.assertTrue(result.response_metadata.valid_mutation_response)
+                self.assertEqual(result.response_metadata.obj_shape, "null")
                 self.assertEqual(result.client.uuid, desired.uuid)
                 self.assertEqual(result.client.expiry_time_ms, desired.expiry_time_ms)
                 self.assertEqual(len(self.posts), 1)
@@ -234,6 +248,98 @@ class XUIWriteWireTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(change=change), self.assertRaises(XUIAmbiguousWriteError):
                 await self.adapter().add_client(self.desired())
         self.assertEqual(self.posts, [])
+
+    async def test_response_contract_ambiguity_add_and_update_no_retry(self):
+        from app.integrations.xui import XUIClientWrite
+        for operation in ("add", "update"):
+            for behavior in ("unknown_obj", "invalid_pending", "other_obj", "missing_obj", "invalid_envelope",
+                             "malformed", "rejected", "drop", "timeout"):
+                with self.subTest(operation=operation, behavior=behavior):
+                    self.posts.clear()
+                    self.post_behavior = behavior
+                    adapter = self.adapter(mode="token", timeout=1)
+                    desired = self.desired()
+                    if operation == "add":
+                        self.record = None
+                        result = await adapter.add_client(desired)
+                    else:
+                        self.stored()
+                        current = await adapter.get_client("123")
+                        desired = XUIClientWrite.from_client(current, expiry_time_ms=2000000000000,
+                            limit_ip=current.limit_ip, enable=current.enable)
+                        result = await adapter.update_client(current, desired)
+                    self.assertIsNone(result.node_pending)
+                    self.assertTrue(result.reconciled)
+                    self.assertEqual(len(self.posts), 1)
+                    info = result.response_metadata
+                    self.assertEqual(info.response_received, behavior not in ("timeout", "drop"))
+                    if behavior == "rejected":
+                        self.assertIs(info.success, False)
+                        self.assertTrue(info.envelope_valid)
+                        self.assertFalse(info.valid_mutation_response)
+                    if behavior == "unknown_obj":
+                        self.assertEqual(info.obj_shape, "object")
+                        self.assertFalse(info.node_pending_present)
+                    if behavior in ("missing_obj", "invalid_envelope", "malformed"):
+                        self.assertFalse(info.envelope_valid)
+
+    async def test_explicit_false_boolean_remains_supported(self):
+        self.post_behavior = "explicit_false"
+        result = await self.adapter().add_client(self.desired())
+        self.assertIs(result.node_pending, False)
+        self.assertTrue(result.response_metadata.node_pending_present)
+        self.assertIs(result.response_metadata.node_pending_value, False)
+
+    async def test_pending_true_contract_add_and_update(self):
+        from app.integrations.xui import XUIClientWrite
+        self.pending = True
+        adapter = self.adapter(mode="token")
+        result = await adapter.add_client(self.desired())
+        self.assertIs(result.node_pending, True)
+        current = result.client
+        desired = XUIClientWrite.from_client(current, expiry_time_ms=2000000000000,
+            limit_ip=current.limit_ip, enable=current.enable)
+        result = await adapter.update_client(current, desired)
+        self.assertIs(result.node_pending, True)
+        self.assertTrue(result.response_metadata.node_pending_present)
+        self.assertIs(result.response_metadata.node_pending_value, True)
+        self.assertEqual(len(self.posts), 2)
+
+    async def test_real_wire_vpn_result_drives_payment_completion_or_review(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from app.bot.services.vpn import VPNService
+        from app.integrations.xui import XUIInboundSummary
+        from test_payment_idempotency import PaymentIdempotencyTests, Status
+
+        data = json.loads((Path(__file__).parent / "fixtures/xui/v3_8_5/inbound_xhttp.json").read_text())
+        self.inbounds = [data]
+        for behavior in ("null_obj", "malformed"):
+            with self.subTest(behavior=behavior):
+                self.record = None
+                self.posts.clear()
+                self.post_behavior = behavior
+                adapter = self.adapter(mode="token")
+                pool = SimpleNamespace(
+                    get_connection=AsyncMock(return_value=SimpleNamespace(adapter=adapter)),
+                    validate_configured_inbound=AsyncMock(return_value=XUIInboundSummary.from_api(data)))
+                vpn = VPNService(SimpleNamespace(xui=SimpleNamespace(INBOUND_ID=6)), None, pool)
+                user = SimpleNamespace(tg_id=123, vpn_id=UUID, server_id=7)
+                payment = PaymentIdempotencyTests()
+                payment.setUp()
+                async def provision(**kwargs):
+                    return await vpn.create_client(user, 2, 30)
+                payment.vpn.extend_subscription.side_effect = provision
+                await payment.gateway.handle_payment_succeeded("payment-1")
+                expected = Status.COMPLETED if behavior == "null_obj" else Status.REVIEW_REQUIRED
+                self.assertEqual(payment.transaction.status, expected)
+                if expected == Status.COMPLETED:
+                    payment.referral.add_referrers_rewards_on_payment.assert_awaited_once()
+                else:
+                    payment.referral.add_referrers_rewards_on_payment.assert_not_awaited()
+                await payment.gateway.handle_payment_succeeded("payment-1")
+                self.assertEqual(len(self.posts), 1)
 
     async def test_update_preserves_fields_and_memberships(self):
         from app.integrations.xui import XUIClientWrite

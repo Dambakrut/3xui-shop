@@ -253,14 +253,42 @@ class XUIClientWrite:
         return payload
 
 
+@dataclass(slots=True)
+class XUIMutationResponseMetadata:
+    """Request-local diagnostics; never retain a body, message or identifier."""
+
+    response_received: bool = False
+    http_status: int | None = None
+    envelope_valid: bool = False
+    success: bool | None = None
+    obj_shape: str = "missing"
+    node_pending_present: bool = False
+    node_pending_value: bool | None = None
+    valid_mutation_response: bool = False
+
+    def inspect_envelope(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        self.success = payload.get("success") if type(payload.get("success")) is bool else None
+        self.envelope_valid = self.success is not None and "obj" in payload
+        if "obj" in payload:
+            obj = payload["obj"]
+            self.obj_shape = "null" if obj is None else "object" if isinstance(obj, dict) else "other"
+            if isinstance(obj, dict):
+                self.node_pending_present = "nodePending" in obj
+                value = obj.get("nodePending")
+                self.node_pending_value = value if type(value) is bool else None
+
+
 @dataclass(frozen=True, slots=True)
 class XUIWriteResult:
     client: XUIClient = field(repr=False)
-    # False/True only from an explicit mutation response nodePending boolean.
+    # False: valid add/update response with obj=null or explicit false.
     # None: persistence confirmed, but node activation is unknown.
     node_pending: bool | None
     reconciled: bool
     success: bool = True  # Canonical persistence verified, not node activation.
+    response_metadata: XUIMutationResponseMetadata | None = None
 
 
 def is_member_of(client: XUIClient, inbound_id: int) -> bool:

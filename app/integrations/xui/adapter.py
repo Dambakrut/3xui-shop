@@ -27,6 +27,7 @@ from .models import (
     XUIInboundSummary,
     XUIServerStatus,
     XUIWriteResult,
+    XUIMutationResponseMetadata,
 )
 
 
@@ -120,6 +121,7 @@ class XUIAdapter:
         self, method: str, endpoint: str, *, json_body: dict[str, Any] | None = None,
         login: bool = False, csrf_bootstrap: bool = False, not_found_on_gorm: bool = False,
         mutation: bool = False,
+        response_metadata: XUIMutationResponseMetadata | None = None,
     ) -> Any:
         session = self._get_session()
         headers = {"Accept": "application/json"}
@@ -135,6 +137,9 @@ class XUIAdapter:
                 allow_redirects=False,
             ) as response:
                 status = response.status
+                if response_metadata is not None:
+                    response_metadata.response_received = True
+                    response_metadata.http_status = status
                 if status == 401 or (status == 404 and self.auth_mode is XUIAuthMode.SESSION
                                      and not csrf_bootstrap and not login):
                     raise XUIAuthenticationError("Panel authentication failed")
@@ -148,6 +153,8 @@ class XUIAdapter:
                     raise XUITransportError(f"Panel HTTP error {status}")
                 try:
                     payload = await response.json(content_type=None)
+                    if response_metadata is not None:
+                        response_metadata.inspect_envelope(payload)
                 except (ValueError, aiohttp.ContentTypeError) as exc:
                     raise XUIProtocolError("Panel returned invalid JSON") from exc
         except XUIError:
@@ -167,6 +174,8 @@ class XUIAdapter:
             raise XUIAPIError("Panel API rejected request")
         if not login and "obj" not in payload:
             raise XUIProtocolError("Panel response is missing obj")
+        if response_metadata is not None:
+            response_metadata.valid_mutation_response = True
         return payload.get("obj")
 
     async def authenticate(self) -> None:
@@ -323,8 +332,10 @@ class XUIAdapter:
                       desired: XUIClientWrite) -> XUIWriteResult:
         if not self._authenticated:
             await self.authenticate()
+        metadata = XUIMutationResponseMetadata()
         try:
-            obj = await self._request("POST", endpoint, json_body=body, mutation=True)
+            obj = await self._request("POST", endpoint, json_body=body, mutation=True,
+                                      response_metadata=metadata)
         except XUIError as exc:
             # A failed response, malformed envelope, timeout or connection reset
             # can all follow a partial commit in v3.8.5. Never replay POST.
@@ -335,19 +346,22 @@ class XUIAdapter:
             return XUIWriteResult(
                 client=client,
                 node_pending=None, reconciled=True,
+                response_metadata=metadata,
             )
         if obj is None:
-            # Canonical persistence cannot establish node activation without
-            # an explicit nodePending field in the mutation response.
-            node_pending = None
+            # v3.8.5 pendingNodeObj(false) returns nil. Only a received,
+            # validated successful response establishes this, never a GET.
+            node_pending = False if metadata.valid_mutation_response else None
         elif isinstance(obj, dict) and type(obj.get("nodePending")) is bool:
             node_pending = obj["nodePending"]
         else:
             # The envelope was successful but its outcome object is unknown.
-            await self._read_after_write(desired)
-            raise XUIReconciliationError("Unknown client write response")
+            # Neither create nor update emits another successful object in
+            # v3.8.5. Unknown shapes cannot establish node activation.
+            node_pending = None
         client = await self._read_after_write(desired)
-        return XUIWriteResult(client=client, node_pending=node_pending, reconciled=True)
+        return XUIWriteResult(client=client, node_pending=node_pending, reconciled=True,
+                              response_metadata=metadata)
 
     async def add_client(self, desired: XUIClientWrite) -> XUIWriteResult:
         """Create one explicit membership, with pre-read and post-read guards."""

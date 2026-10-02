@@ -178,3 +178,9 @@ cython_debug/
 plans.json
 
 tmp_test/
+
+# Manual production smoke identity/journal; never publish client credentials.
+.xui-write-smoke-state.json
+.xui-write-smoke-state.json.tmp
+.xui-write-smoke-state.lock
+.xui-write-smoke-outcome.json

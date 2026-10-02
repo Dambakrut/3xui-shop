@@ -169,10 +169,11 @@ XUIReconciliationError, a subclass of XUIAmbiguousWriteError.
 
 Persistence confirmation != node activation confirmation.
 XUIWriteResult.success means canonical persistence verified, not node activation.
-node_pending=False means a valid write response explicitly returned nodePending=false;
+node_pending=False means a valid add/update response returned obj=null (the
+v3.8.5 pendingNodeObj(false) contract), or explicitly returned nodePending=false;
 True means a valid write response explicitly returned nodePending=true.
 None means canonical persistence confirmed but activation unknown: no-POST existing
-or already-desired shortcuts, success with obj=null, or a lost mutation response.
+or already-desired shortcuts, unsupported outcome objects, or a lost/invalid mutation response.
 VPNService accepts only False for completed provisioning;
 True/None raises uncertainty. Existing payment state machine sends uncertainty to
 REVIEW_REQUIRED and duplicate callback does not replay writes. No payment code
@@ -181,6 +182,30 @@ durable, and exactly-once writes across crashes are not claimed. Notification an
 referral post-completion crash windows remain unchanged.
 
 ## HTTP subscription URL
+
+### Patch 6D.1 mutation response correction
+
+Verified against the tagged [client handlers](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go)
+and [response helpers](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/util.go):
+create calls pendingNodeObj(AnyNodePending(inboundIds)); update calls
+pendingNodeObj(HasPendingNode(email)). This helper emits null for no pending work,
+and an object with nodePending=true otherwise. Neither handler emits another
+successful object or an explicit nodePending=false. Explicit false remains
+accepted as a boolean compatibility form; an unknown object is not evidence
+of no pending work and produces an uncertain reconciled result.
+
+The [Msg schema](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/entity/entity.go)
+includes obj without omitempty: missing obj is a malformed envelope, not null.
+Request-local metadata records receipt, HTTP status, envelope validity, success,
+object shape and a strictly boolean nodePending value. No body/message is retained.
+These diagnostics remain available when canonical reconciliation succeeds after
+a failed response. No-POST shortcuts still return node_pending=None.
+
+Delete uses jsonMsg, not pendingNodeObj. Its normal null object acknowledges the
+handler result but cannot establish absence of remote pending deletion work.
+Smoke cleanup therefore keeps activation UNKNOWN even after canonical absence.
+For add/update, False confirms the panel's no-pending acknowledgement; it is not
+a live VPN handshake or independent proof of Xray data-plane availability.
 
 subLinks returns protocol share links (vless:// etc.), not HTTP subscription URL.
 [Official BuildURLs](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/sub/service.go)
