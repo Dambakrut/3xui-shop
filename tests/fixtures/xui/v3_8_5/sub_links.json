@@ -1,0 +1,5 @@
+{
+  "success": true,
+  "msg": "",
+  "obj": ["vless://example-credential@host.invalid:443#Shop"]
+}

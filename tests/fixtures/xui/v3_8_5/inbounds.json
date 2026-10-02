@@ -1,0 +1,8 @@
+{
+  "success": true,
+  "msg": "",
+  "obj": [
+    {"id": 99, "protocol": "trojan", "enable": true, "remark": "Existing", "tag": "in-99", "streamSettings": {"security": "tls"}},
+    {"id": 42, "protocol": "vless", "enable": true, "remark": "Shop", "tag": "in-42", "streamSettings": {"network": "tcp", "security": "reality"}}
+  ]
+}
