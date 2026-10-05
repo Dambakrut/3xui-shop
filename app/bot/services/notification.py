@@ -189,6 +189,9 @@ class NotificationService:
             message_effect_id=message_effect_id,
         )
 
+    async def notify_payment_review(self, user_id: int) -> None:
+        await self.notify_by_id(chat_id=user_id, text=_("payment:message:review_required"))
+
     async def notify_change_success(
         self,
         user_id: int,

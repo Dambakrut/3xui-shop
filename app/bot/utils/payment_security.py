@@ -8,6 +8,10 @@ class InvalidPayment(ValueError):
     pass
 
 
+class CheckoutUnavailable(RuntimeError):
+    """An existing checkout must not start another provider invoice."""
+
+
 def money(value) -> Decimal:
     try:
         if isinstance(value, bool) or value is None:

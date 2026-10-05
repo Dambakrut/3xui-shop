@@ -28,6 +28,7 @@ else:
 PREVIOUS_HEAD = "032f2bef8d8d"
 NEW_HEAD = "b6d4e8a72c13"
 SECURITY_HEAD = "c4e91b2a70d5"
+FLOW_HEAD = "d7a2f6c890e1"
 
 
 @unittest.skipUnless(DB_DEPENDENCIES_AVAILABLE, "Install DB dependencies for integration tests")
@@ -56,10 +57,66 @@ class MigrationIntegrationTests(unittest.TestCase):
 
     def test_revision_graph_has_one_head(self):
         script = ScriptDirectory.from_config(self.alembic_config)
-        self.assertEqual(script.get_heads(), [SECURITY_HEAD])
+        self.assertEqual(script.get_heads(), [FLOW_HEAD])
+        self.assertEqual(script.get_revision(FLOW_HEAD).down_revision, SECURITY_HEAD)
         self.assertEqual(script.get_revision(SECURITY_HEAD).down_revision, NEW_HEAD)
         self.assertEqual(script.get_revision(NEW_HEAD).down_revision, PREVIOUS_HEAD)
         self.assertEqual(script.get_revision(PREVIOUS_HEAD).down_revision, "579d48dd94ef")
+
+    def test_purchase_flow_upgrade_preserves_legacy_unique_constraints_and_clean_downgrade(self):
+        self.run_migration(command.upgrade, SECURITY_HEAD)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("INSERT INTO users (tg_id,vpn_id,first_name,language_code,created_at,is_trial_used) "
+                               "VALUES (123,'synthetic-user','Test','en',CURRENT_TIMESTAMP,0)")
+            for status in ("pending", "completed", "canceled", "refunded"):
+                connection.execute("INSERT INTO transactions (tg_id,payment_id,subscription,status,created_at,updated_at) "
+                                   "VALUES (123,?,'saved',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", (status, status))
+            connection.commit()
+        self.run_migration(command.upgrade, FLOW_HEAD)
+        engine = sa.create_engine(f"sqlite:///{self.db_path.as_posix()}")
+        try:
+            with sa.orm.Session(engine) as session:
+                rows = session.scalars(sa.select(Transaction)).all()
+                self.assertEqual(len(rows), 4)
+                self.assertTrue(all(r.purchase_flow_id is None and r.payment_url is None for r in rows))
+                inspector = sa.inspect(engine)
+                uniques = {tuple(c["column_names"]) for c in inspector.get_unique_constraints("transactions")}
+                self.assertIn(("purchase_flow_id",), uniques)
+                self.assertIn(("payment_id",), uniques)
+                self.assertIn(("payment_provider", "provider_payment_id"), uniques)
+                self.assertTrue(inspector.get_foreign_keys("transactions"))
+                for payment_id in ("reserved-one", "reserved-two"):
+                    session.add(Transaction(tg_id=123, payment_id=payment_id, subscription="saved",
+                        purchase_flow_id="a" * 32, status=TransactionStatus.CANCELED))
+                    if payment_id == "reserved-one":
+                        session.commit()
+                    else:
+                        with self.assertRaises(sa.exc.IntegrityError):
+                            session.commit()
+                        session.rollback()
+                self.assertEqual(session.execute(sa.text("PRAGMA foreign_key_check")).all(), [])
+        finally:
+            engine.dispose()
+        self.run_migration(command.downgrade, SECURITY_HEAD)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 5)
+            columns = {r[1] for r in connection.execute("PRAGMA table_info(transactions)")}
+            self.assertNotIn("purchase_flow_id", columns)
+            self.assertNotIn("payment_url", columns)
+
+    def test_purchase_flow_downgrade_refuses_active_reservations(self):
+        self.run_migration(command.upgrade, FLOW_HEAD)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("INSERT INTO users (tg_id,vpn_id,first_name,language_code,created_at,is_trial_used) "
+                               "VALUES (123,'synthetic-user','Test','en',CURRENT_TIMESTAMP,0)")
+            connection.execute("INSERT INTO transactions (tg_id,payment_id,subscription,status,purchase_flow_id,created_at,updated_at) "
+                               "VALUES (123,'reservation','saved','review_required',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", ("a" * 32,))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "Resolve active purchase flows"):
+            self.run_migration(command.downgrade, SECURITY_HEAD)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT version_num FROM alembic_version").fetchone()[0], FLOW_HEAD)
+            self.assertEqual(connection.execute("SELECT purchase_flow_id FROM transactions").fetchone()[0], "a" * 32)
 
     def test_security_snapshot_migration_preserves_legacy_and_unique_identity(self):
         self.run_migration(command.upgrade, NEW_HEAD)
@@ -73,7 +130,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "VALUES (123, 'legacy', 'plan', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
             connection.commit()
-        self.run_migration(command.upgrade, SECURITY_HEAD)
+        self.run_migration(command.upgrade, FLOW_HEAD)
         engine = sa.create_engine(f"sqlite:///{self.db_path.as_posix()}")
         try:
             with sa.orm.Session(engine) as session:

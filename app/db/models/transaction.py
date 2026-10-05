@@ -40,8 +40,11 @@ class Transaction(Base):
     expected_amount: Mapped[str | None] = mapped_column(String(64), nullable=True)
     expected_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    purchase_flow_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payment_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     __table_args__ = (
         UniqueConstraint("payment_provider", "provider_payment_id", name="uq_provider_payment"),
+        UniqueConstraint("purchase_flow_id", name="uq_transaction_purchase_flow"),
     )
     status: Mapped[TransactionStatus] = mapped_column(
         Enum(TransactionStatus, values_callable=lambda obj: [e.value for e in obj]),
@@ -77,6 +80,40 @@ class Transaction(Base):
             select(Transaction).options(selectinload(Transaction.user)).where(*filter)
         )
         return query.scalars().all()
+
+    @classmethod
+    async def get_by_purchase_flow(cls, session: AsyncSession, flow_id: str) -> Self | None:
+        return await session.scalar(select(cls).where(cls.purchase_flow_id == flow_id))
+
+    @classmethod
+    async def reserve_purchase_flow(cls, session: AsyncSession, flow_id: str, **values) -> tuple[Self, bool]:
+        # Commit the unique reservation BEFORE any provider I/O. REVIEW_REQUIRED
+        # is deliberately non-payable until a verified invoice action is saved.
+        row = cls(purchase_flow_id=flow_id, status=TransactionStatus.REVIEW_REQUIRED, **values)
+        session.add(row)
+        try:
+            await session.commit()
+            await session.refresh(row)
+            return row, True
+        except IntegrityError:
+            await session.rollback()
+            existing = await cls.get_by_purchase_flow(session, flow_id)
+            if existing is None:
+                raise  # Not a duplicate flow (e.g. broken FK); do not hide it.
+            return existing, False
+
+    @classmethod
+    async def finish_invoice(cls, session: AsyncSession, flow_id: str, payment_id: str,
+                             payment_url: str, provider_payment_id: str | None) -> bool:
+        result = await session.execute(update(cls).where(
+            cls.purchase_flow_id == flow_id,
+            cls.status == TransactionStatus.REVIEW_REQUIRED,
+            cls.payment_url.is_(None),
+        ).values(payment_id=payment_id, payment_url=payment_url,
+                 provider_payment_id=provider_payment_id, status=TransactionStatus.PENDING)
+            .execution_options(synchronize_session=False))
+        await session.commit()
+        return result.rowcount == 1
 
     @classmethod
     async def create(cls, session: AsyncSession, payment_id: str, **kwargs: Any) -> Self | None:
@@ -123,6 +160,8 @@ class Transaction(Base):
 
     @classmethod
     async def update(cls, session: AsyncSession, payment_id: str, **kwargs: Any) -> Self | None:
+        if "purchase_flow_id" in kwargs:
+            raise ValueError("Purchase flow identity is immutable")
         transaction = await Transaction.get_by_id(session=session, payment_id=payment_id)
 
         if transaction:

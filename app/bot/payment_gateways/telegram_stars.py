@@ -1,5 +1,4 @@
 import logging
-import uuid
 
 from aiogram import Bot
 from aiogram.fsm.storage.redis import RedisStorage
@@ -18,7 +17,7 @@ from app.bot.utils.formatting import format_device_count, format_subscription_pe
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
-from app.bot.utils.payment_security import InvalidPayment, payment_snapshot
+from app.bot.utils.payment_security import InvalidPayment
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +48,15 @@ class TelegramStars(PaymentGateway):
         self.i18n = i18n
         logger.info("TelegramStars payment gateway initialized.")
 
-    async def create_payment(self, data: SubscriptionData) -> str:
-        if await IsDev()(user_id=data.user_id):
-            amount = 1
-        else:
-            amount = int(data.price)
+    async def _invoice_amount(self, data: SubscriptionData):
+        amount = 1 if await IsDev()(user_id=data.user_id) else int(data.price)
         if amount <= 0:
             raise InvalidPayment("invalid Stars invoice amount")
-        order_id = str(uuid.uuid4())
-        async with self.session() as session:
-            transaction = await Transaction.create(
-                session=session, tg_id=data.user_id, subscription=data.pack(),
-                payment_id=order_id, status=TransactionStatus.PENDING,
-                **payment_snapshot(self.provider, self.currency.code, amount),
-            )
-            if transaction is None:
-                raise RuntimeError("Could not persist Stars order")
+        return amount
 
+    async def _create_invoice(self, data: SubscriptionData, transaction):
+        amount = int(transaction.expected_amount)
+        order_id = transaction.payment_id
         prices = [LabeledPrice(label=self.currency.code, amount=amount)]
         devices = format_device_count(data.devices)
         duration = format_subscription_period(data.duration)
@@ -79,7 +70,7 @@ class TelegramStars(PaymentGateway):
             currency=self.currency.code,
         )
         logger.info("Stars payment link created.")
-        return pay_url
+        return pay_url, order_id, None
 
     async def validate_checkout(self, order_id, user_id, amount, currency):
         if currency != "XTR" or type(amount) is not int:

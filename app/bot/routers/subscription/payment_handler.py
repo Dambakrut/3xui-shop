@@ -1,18 +1,20 @@
 import logging
+import re
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
 from aiogram.utils.i18n import gettext as _
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.models import ServicesContainer, SubscriptionData
+from app.bot.models import CheckoutData, ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import GatewayFactory
 from app.bot.utils.formatting import format_subscription_period
 from app.bot.utils.navigation import NavSubscription
-from app.db.models import User
-from app.bot.utils.payment_security import InvalidPayment
+from app.db.models import Transaction, User
+from app.bot.utils.payment_security import CheckoutUnavailable, InvalidPayment
 
 from .keyboard import pay_keyboard
 
@@ -24,60 +26,83 @@ class PaymentState(StatesGroup):
     processing = State()
 
 
-@router.callback_query(SubscriptionData.filter(F.state.startswith(NavSubscription.PAY)))
+@router.callback_query(CheckoutData.filter())
 async def callback_payment_method_selected(
     callback: CallbackQuery,
     user: User,
-    callback_data: SubscriptionData,
+    callback_data: CheckoutData,
     services: ServicesContainer,
     bot: Bot,
     gateway_factory: GatewayFactory,
     state: FSMContext,
 ) -> None:
-    if (callback_data.user_id != user.tg_id or callback.from_user.id != user.tg_id
-        or callback_data.devices <= 0 or callback_data.duration <= 0
-        or (callback_data.is_extend and callback_data.is_change)):
-        logger.warning("Payment selection user mismatch.")
+    if (callback.from_user.id != user.tg_id
+            or not re.fullmatch(r"[0-9a-f]{32}", callback_data.flow_id)):
+        logger.warning("Invalid checkout reference")
         return
-    if await state.get_state() == PaymentState.processing:
-        logger.debug("Payment selection is already being processed.")
-        return
-
-    await state.set_state(PaymentState.processing)
-
     try:
-        method = callback_data.state
-        devices = callback_data.devices
-        duration = callback_data.duration
-        logger.info("Payment method selected: %s", method)
-        gateway = gateway_factory.get_gateway(method)
-        plan = services.plan.get_plan(devices)
-        price = plan.get_price(currency=gateway.currency, duration=duration)
-        callback_data.price = price
+        gateway = next((g for g in gateway_factory.get_gateways()
+                        if g.provider == callback_data.provider), None)
+        if gateway is None:
+            raise InvalidPayment("unknown checkout provider")
+        async with gateway.session() as session:
+            saved = await Transaction.get_by_purchase_flow(session, callback_data.flow_id)
+        if saved is not None:
+            if saved.tg_id != user.tg_id or saved.payment_provider != gateway.provider:
+                raise InvalidPayment("checkout owner/provider mismatch")
+            data = SubscriptionData.unpack(saved.subscription)
+        else:
+            context = await state.get_data()
+            if context.get("checkout_flow_id") != callback_data.flow_id:
+                raise InvalidPayment("expired checkout context")
+            data = SubscriptionData.unpack(context["checkout_subscription"])
+            if data.user_id != user.tg_id:
+                raise InvalidPayment("checkout user mismatch")
+            plan = services.plan.get_plan(data.devices)
+            if plan is None or data.duration not in services.plan.get_durations():
+                raise InvalidPayment("invalid checkout plan")
+            data.state = gateway.callback
+            data.price = plan.get_price(currency=gateway.currency, duration=data.duration)
 
-        pay_url = await gateway.create_payment(callback_data)
-
-        if callback_data.is_extend:
+        # DB unique reservation owns provider I/O; FSM is not a lock or proof.
+        await state.set_state(PaymentState.processing)
+        pay_url = await gateway.create_payment(data, purchase_flow_id=callback_data.flow_id)
+        # Always display the immutable original snapshot, even after repricing.
+        async with gateway.session() as session:
+            saved = await Transaction.get_by_purchase_flow(session, callback_data.flow_id)
+        data = SubscriptionData.unpack(saved.subscription)
+        if data.is_extend:
             text = _("payment:message:order_extend")
-        elif callback_data.is_change:
+        elif data.is_change:
             text = _("payment:message:order_change")
         else:
             text = _("payment:message:order")
-
-        await callback.message.edit_text(
-            text=text.format(
-                devices=devices,
-                duration=format_subscription_period(duration),
-                price=price,
-                currency=gateway.currency.symbol,
-            ),
-            reply_markup=pay_keyboard(pay_url=pay_url, callback_data=callback_data),
-        )
+        try:
+            await callback.message.edit_text(
+                text=text.format(devices=data.devices,
+                    duration=format_subscription_period(data.duration),
+                    price=data.price, currency=gateway.currency.symbol),
+                reply_markup=pay_keyboard(pay_url=pay_url, callback_data=data),
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in error.message.lower():
+                raise
+    except CheckoutUnavailable:
+        await services.notification.show_popup(callback=callback, text=_("payment:popup:checkout_handled"))
+    except InvalidPayment:
+        logger.warning("Checkout reference rejected")
+        await services.notification.show_popup(callback=callback, text=_("payment:popup:checkout_expired"))
     except Exception:
-        logger.error("Payment creation failed.")
+        logger.error("Payment creation failed")
         await services.notification.show_popup(callback=callback, text=_("payment:popup:error"))
     finally:
         await state.set_state(None)
+
+
+@router.callback_query(SubscriptionData.filter(F.state.startswith(NavSubscription.PAY)))
+async def callback_legacy_payment_selection(callback: CallbackQuery, services: ServicesContainer) -> None:
+    # Old buttons have no durable checkout identity; never create from them.
+    await services.notification.show_popup(callback=callback, text=_("payment:popup:checkout_expired"))
 
 
 @router.pre_checkout_query()

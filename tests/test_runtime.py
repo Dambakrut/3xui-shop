@@ -20,7 +20,7 @@ AVAILABLE = all(importlib.util.find_spec(name) for name in
 def dummy_env(directory):
     # No production .env or inherited credentials are used.
     return {
-        "BOT_TOKEN": "123456789:" + "a" * 35,
+        "BOT_TOKEN": "246802468:" + "a" * 35,
         "BOT_WEBHOOK_SECRET": "local_test_secret",
         "BOT_DEV_ID": "123", "BOT_SUPPORT_ID": "123", "BOT_DOMAIN": "shop.invalid",
         "XUI_USERNAME": "dummy", "XUI_PASSWORD": "dummy", "XUI_INBOUND_ID": "42",
@@ -125,7 +125,7 @@ class RuntimeTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 if args == ("heads",):
-                    self.assertEqual(result.stdout.strip(), "c4e91b2a70d5 (head)")
+                    self.assertEqual(result.stdout.strip(), "d7a2f6c890e1 (head)")
             engine = create_engine(f"sqlite:///{Path(directory).as_posix()}/runtime.sqlite3")
             try:
                 with Session(engine) as session:

@@ -1,4 +1,5 @@
 import logging
+import hashlib
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -21,6 +22,15 @@ from .keyboard import (
 
 logger = logging.getLogger(__name__)
 router = Router(name=__name__)
+
+
+async def _begin_checkout(callback: CallbackQuery, user: User, state: FSMContext) -> None:
+    # Only an explicit buy/extend/change action starts a new checkout. A
+    # redelivered start callback keeps its identity; navigation back does not.
+    flow_id = hashlib.sha256(
+        f"{callback.bot.id}:{user.tg_id}:{callback.id}".encode()
+    ).hexdigest()[:32]
+    await state.update_data(checkout_flow_id=flow_id, checkout_subscription=None)
 
 
 async def show_subscription(
@@ -80,6 +90,7 @@ async def callback_subscription_extend(
     callback_data: SubscriptionData,
     config: Config,
     services: ServicesContainer,
+    state: FSMContext,
 ) -> None:
     logger.info(f"User {user.tg_id} started extend subscription.")
     client = await services.vpn.is_client_exists(user)
@@ -95,6 +106,7 @@ async def callback_subscription_extend(
     callback_data.devices = current_devices
     callback_data.state = NavSubscription.DURATION
     callback_data.is_extend = True
+    await _begin_checkout(callback, user, state)
     await callback.message.edit_text(
         text=_("subscription:message:duration"),
         reply_markup=duration_keyboard(
@@ -111,10 +123,12 @@ async def callback_subscription_change(
     user: User,
     callback_data: SubscriptionData,
     services: ServicesContainer,
+    state: FSMContext,
 ) -> None:
     logger.info(f"User {user.tg_id} started change subscription.")
     callback_data.state = NavSubscription.DEVICES
     callback_data.is_change = True
+    await _begin_checkout(callback, user, state)
     await callback.message.edit_text(
         text=_("subscription:message:devices"),
         reply_markup=devices_keyboard(services.plan.get_all_plans(), callback_data),
@@ -128,6 +142,7 @@ async def callback_subscription_process(
     session: AsyncSession,
     callback_data: SubscriptionData,
     services: ServicesContainer,
+    state: FSMContext,
 ) -> None:
     logger.info(f"User {user.tg_id} started subscription process.")
     server = await services.server_pool.get_available_server()
@@ -141,6 +156,7 @@ async def callback_subscription_process(
         return
 
     callback_data.state = NavSubscription.DEVICES
+    await _begin_checkout(callback, user, state)
     await callback.message.edit_text(
         text=_("subscription:message:devices"),
         reply_markup=devices_keyboard(services.plan.get_all_plans(), callback_data),
@@ -174,14 +190,28 @@ async def callback_duration_selected(
     callback_data: SubscriptionData,
     services: ServicesContainer,
     gateway_factory: GatewayFactory,
+    state: FSMContext,
 ) -> None:
+    if (callback_data.user_id != user.tg_id or callback.from_user.id != user.tg_id
+            or not services.plan.get_plan(callback_data.devices)
+            or callback_data.duration not in services.plan.get_durations()
+            or (callback_data.is_extend and callback_data.is_change)):
+        logger.warning("Invalid subscription checkout context")
+        return
     logger.info(f"User {user.tg_id} selected duration: {callback_data.duration}")
     callback_data.state = NavSubscription.PAY
+    context = await state.get_data()
+    flow_id = context.get("checkout_flow_id")
+    if not flow_id:
+        await services.notification.show_popup(callback=callback, text=_("payment:popup:checkout_expired"))
+        return
+    await state.update_data(checkout_flow_id=flow_id, checkout_subscription=callback_data.pack())
     await callback.message.edit_text(
         text=_("subscription:message:payment_method"),
         reply_markup=payment_method_keyboard(
             plan=services.plan.get_plan(callback_data.devices),
             callback_data=callback_data,
             gateways=gateway_factory.get_gateways(),
+            flow_id=flow_id,
         ),
     )

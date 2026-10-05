@@ -1,56 +1,51 @@
+"""Minimal Telegram diagnostics: never serialize updates or exception payloads."""
 import logging
-import traceback
+from html import escape
 
 from aiogram import Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import ExceptionTypeFilter
-from aiogram.types import BufferedInputFile, ErrorEvent
-from aiogram.utils.formatting import Bold, Code, Text
+from aiogram.types import ErrorEvent
 
 from app.bot.models import ServicesContainer
-from app.bot.utils.misc import split_text
 from app.config import Config
 
 logger = logging.getLogger(__name__)
 router = Router(name=__name__)
 
 
+def diagnostic_summary(event: ErrorEvent) -> str:
+    update = event.update
+    try:
+        update_type = update.event_type
+        telegram_event = update.event
+    except Exception:
+        update_type, telegram_event = "unknown", None
+    user = getattr(telegram_event, "from_user", None)
+    chat = getattr(telegram_event, "chat", None)
+    if chat is None:
+        chat = getattr(getattr(telegram_event, "message", None), "chat", None)
+    return (f"update_id={update.update_id} type={update_type} "
+            f"user_id={getattr(user, 'id', None)} chat_id={getattr(chat, 'id', None)} "
+            f"exception_type={type(event.exception).__name__} details=redacted")
+
+
 @router.errors(ExceptionTypeFilter(Exception))
 async def errors_handler(event: ErrorEvent, config: Config, services: ServicesContainer) -> bool:
-    if isinstance(event.exception, TelegramForbiddenError):
-        logger.info(f"User {event.update.message.from_user.id} blocked the bot.")
+    summary = diagnostic_summary(event)
+    if isinstance(event.exception, (TelegramForbiddenError, TelegramBadRequest)):
+        logger.warning("Telegram request rejected: %s", summary)
         return True
 
-    if isinstance(event.exception, TelegramBadRequest):
-        logger.warning(
-            f"User {event.update.callback_query.from_user.id} bad request for edit/send message."
-        )
-        return True
-
-    logger.exception(f"Update: {event.update}\nException: {event.exception}")
-
-    if not config.bot.DEV_ID:
-        return True
-
-    try:
-        text = Text(Bold((type(event.exception).__name__)), f": {str(event.exception)[:1021]}...")
-        await services.notification.notify_developer(
-            text=text.as_html(),
-            document=BufferedInputFile(
-                file=traceback.format_exc().encode(),
-                filename=f"error_{event.update.update_id}.txt",
-            ),
-        )
-
-        update_json = event.update.model_dump_json(indent=2, exclude_none=True)
-        for chunk in split_text(update_json):
-            await services.notification.notify_developer(
-                text=Code(chunk).as_html(),
-            )
-
-    except TelegramBadRequest as exception:
-        logger.warning(f"Failed to send error details: {exception}")
-    except Exception as exception:
-        logger.error(f"Unexpected error in error handler: {exception}")
-
+    # Preserve original stack frames, never the original exception string,
+    # chained exception payloads, locals, or Update repr. A library exception
+    # can contain payment data even when its type/message looks harmless.
+    sanitized = RuntimeError("Exception details redacted")
+    logger.error("Telegram handler failed: %s", summary,
+                 exc_info=(RuntimeError, sanitized, event.exception.__traceback__))
+    if config.bot.DEV_ID:
+        try:
+            await services.notification.notify_developer(text=escape(summary))
+        except Exception:
+            logger.error("Could not send sanitized error notification")
     return True

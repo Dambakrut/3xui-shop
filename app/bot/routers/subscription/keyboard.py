@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.i18n import gettext as _
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.bot.models import SubscriptionData
+from app.bot.models import CheckoutData, SubscriptionData
 from app.bot.models.plan import Plan
 from app.bot.payment_gateways import PaymentGateway
 from app.bot.routers.misc.keyboard import (
@@ -136,6 +136,7 @@ def payment_method_keyboard(
     plan: Plan,
     callback_data: SubscriptionData,
     gateways: list[PaymentGateway],
+    flow_id: str,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for gateway in gateways:
@@ -147,7 +148,7 @@ def payment_method_keyboard(
         builder.row(
             InlineKeyboardButton(
                 text=f"{gateway.name} | {price} {gateway.currency.symbol}",
-                callback_data=callback_data.pack(),
+                callback_data=CheckoutData(flow_id=flow_id, provider=gateway.provider).pack(),
             )
         )
 

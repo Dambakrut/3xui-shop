@@ -15,12 +15,12 @@ from yookassa.domain.request.payment_request import PaymentRequest
 
 from app.bot.models import ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import PaymentGateway
-from app.bot.utils.constants import YOOKASSA_WEBHOOK, Currency, TransactionStatus
+from app.bot.utils.constants import YOOKASSA_WEBHOOK, Currency
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
-from app.bot.utils.payment_security import InvalidPayment, payment_snapshot
+from app.bot.utils.payment_security import InvalidPayment
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class Yookassa(PaymentGateway):
         self.app.router.add_post(YOOKASSA_WEBHOOK, self.webhook_handler)
         logger.info("YooKassa payment gateway initialized.")
 
-    async def create_payment(self, data: SubscriptionData) -> str:
+    async def _create_invoice(self, data: SubscriptionData, transaction):
         bot_username = (await self.bot.get_me()).username
         redirect_url = f"https://t.me/{bot_username}"
 
@@ -87,23 +87,10 @@ class Yookassa(PaymentGateway):
             metadata={"tg_id": str(data.user_id), "subscription": data.pack()},
         )
 
-        response = await asyncio.to_thread(Payment.create, request)
-
-        async with self.session() as session:
-            transaction = await Transaction.create(
-                session=session,
-                tg_id=data.user_id,
-                subscription=data.pack(),
-                payment_id=response.id,
-                status=TransactionStatus.PENDING,
-                **payment_snapshot(self.provider, self.currency.code, price, response.id),
-            )
-            if transaction is None:
-                raise RuntimeError("Could not persist YooKassa order")
-
+        response = await asyncio.to_thread(Payment.create, request, transaction.purchase_flow_id)
         pay_url = response.confirmation["confirmation_url"]
         logger.info("YooKassa payment link created.")
-        return pay_url
+        return pay_url, response.id, response.id
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
         await self._on_payment_succeeded(payment_id)

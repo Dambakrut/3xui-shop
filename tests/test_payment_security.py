@@ -20,7 +20,7 @@ from weakref import WeakValueDictionary
 from app.bot.utils.constants import Currency, TransactionStatus
 from app.bot.utils.navigation import NavSubscription
 from app.bot.utils.payment_security import (
-    InvalidPayment, money, payment_snapshot, safe_client_ip, validate_order,
+    CheckoutUnavailable, InvalidPayment, money, payment_snapshot, safe_client_ip, validate_order,
 )
 from test_safe_inbound import SessionContext, load_definitions, ROOT
 
@@ -33,6 +33,27 @@ class GatewaySecurityTests(unittest.IsolatedAsyncioTestCase):
         parent = self
 
         class FakeTransaction:
+            @classmethod
+            async def reserve_purchase_flow(cls, session, flow_id, **values):
+                existing = next((r for r in parent.records.values()
+                                 if getattr(r, "purchase_flow_id", None) == flow_id), None)
+                if existing:
+                    return existing, False
+                row = NS(**values, purchase_flow_id=flow_id, payment_url=None,
+                         status=TransactionStatus.REVIEW_REQUIRED)
+                parent.records[row.payment_id] = row
+                return row, True
+
+            @classmethod
+            async def finish_invoice(cls, session, flow_id, payment_id, payment_url, provider_payment_id):
+                row = next(r for r in parent.records.values() if getattr(r, "purchase_flow_id", None) == flow_id)
+                del parent.records[row.payment_id]
+                row.payment_id, row.payment_url = payment_id, payment_url
+                row.provider_payment_id = provider_payment_id
+                row.status = TransactionStatus.PENDING
+                parent.records[payment_id] = row
+                return True
+
             @classmethod
             async def get_by_id(cls, session, payment_id):
                 return parent.records.get(payment_id)
@@ -66,12 +87,13 @@ class GatewaySecurityTests(unittest.IsolatedAsyncioTestCase):
                 return parent.dev
 
         self.namespace = dict(
-            asyncio=asyncio, logging=logging, logger=logging.getLogger("payment-security-test"),
+            asyncio=asyncio, logging=logging, re=re, logger=logging.getLogger("payment-security-test"),
             ABC=ABC, abstractmethod=abstractmethod, WeakValueDictionary=WeakValueDictionary,
             _payment_locks=WeakValueDictionary(),
             Transaction=FakeTransaction, TransactionStatus=TransactionStatus,
             SubscriptionData=NS(unpack=lambda raw: parent.data),
-            InvalidPayment=InvalidPayment, validate_order=validate_order, money=money,
+            CheckoutUnavailable=CheckoutUnavailable, InvalidPayment=InvalidPayment,
+            validate_order=validate_order, money=money,
             payment_snapshot=payment_snapshot, safe_client_ip=safe_client_ip,
             Currency=Currency, NavSubscription=NavSubscription,
             base64=base64, hashlib=hashlib, hmac=hmac, json=json, uuid=uuid,

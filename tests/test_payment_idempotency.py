@@ -73,6 +73,7 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.referral = SimpleNamespace(add_referrers_rewards_on_payment=AsyncMock())
         self.notification = SimpleNamespace(
+            notify_payment_review=AsyncMock(),
             notify_developer=AsyncMock(), notify_extend_success=AsyncMock(),
             notify_change_success=AsyncMock(), notify_purchase_success=AsyncMock(),
         )
@@ -112,7 +113,8 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             config=SimpleNamespace(shop=SimpleNamespace(REFERRER_REWARD_ENABLED=True)),
             session=SessionContext,
             storage=None, bot=None,
-            i18n=SimpleNamespace(use_locale=lambda locale: nullcontext()),
+            i18n=SimpleNamespace(locales={"en": None}, context=lambda: nullcontext(),
+                                use_locale=lambda locale: nullcontext()),
             services=SimpleNamespace(
                 vpn=self.vpn, referral=self.referral, notification=self.notification,
             ),
@@ -156,6 +158,7 @@ class PaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transaction.status, Status.REVIEW_REQUIRED)
         self.vpn.extend_subscription.assert_awaited_once()
         self.referral.add_referrers_rewards_on_payment.assert_not_awaited()
+        self.notification.notify_payment_review.assert_awaited_once_with(user_id=123)
 
     async def test_provisioning_exception_requires_review(self):
         self.vpn.extend_subscription.side_effect = TimeoutError("unknown outcome")

@@ -1237,3 +1237,11 @@ msgid_plural "{} months"
 msgstr[0] ""
 msgstr[1] ""
 
+msgid "payment:message:review_required"
+msgstr "Payment received, but we could not issue access automatically yet. Your order has been sent for manual review. Please do not pay again."
+
+msgid "payment:popup:checkout_handled"
+msgstr "This order is already being handled or requires review. Do not pay again. If you cannot open the payment, contact support."
+
+msgid "payment:popup:checkout_expired"
+msgstr "This checkout is no longer available. Open the subscription menu to start a new checkout."

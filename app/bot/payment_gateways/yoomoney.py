@@ -1,7 +1,6 @@
 import hashlib
 import hmac
 import logging
-import uuid
 from urllib.parse import quote
 
 import requests
@@ -15,12 +14,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import PaymentGateway
-from app.bot.utils.constants import YOOMONEY_WEBHOOK, Currency, TransactionStatus
+from app.bot.utils.constants import YOOMONEY_WEBHOOK, Currency
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
-from app.bot.utils.payment_security import InvalidPayment, money, payment_snapshot
+from app.bot.utils.payment_security import InvalidPayment, money
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,7 @@ class Yoomoney(PaymentGateway):
         self.app.router.add_post(YOOMONEY_WEBHOOK, self.webhook_handler)
         logger.info("YooMoney payment gateway initialized.")
 
-    async def create_payment(self, data: SubscriptionData) -> str:
+    async def _create_invoice(self, data: SubscriptionData, transaction):
         bot_username = (await self.bot.get_me()).username
         redirect_url = f"https://t.me/{bot_username}"
 
@@ -63,7 +62,7 @@ class Yoomoney(PaymentGateway):
         )
 
         price = str(data.price)
-        payment_id = str(uuid.uuid4())
+        payment_id = transaction.payment_id
 
         pay_url = self.create_quickpay_url(
             receiver=self.config.yoomoney.WALLET_ID,
@@ -75,20 +74,8 @@ class Yoomoney(PaymentGateway):
             successURL=redirect_url,
         )
 
-        async with self.session() as session:
-            transaction = await Transaction.create(
-                session=session,
-                tg_id=data.user_id,
-                subscription=data.pack(),
-                payment_id=payment_id,
-                status=TransactionStatus.PENDING,
-                **payment_snapshot(self.provider, self.currency.code, price),
-            )
-            if transaction is None:
-                raise RuntimeError("Could not persist YooMoney order")
-
         logger.info("YooMoney payment link created.")
-        return pay_url
+        return pay_url, payment_id, None
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
         await self._on_payment_succeeded(payment_id)

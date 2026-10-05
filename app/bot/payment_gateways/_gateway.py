@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import re
+import uuid
 from abc import ABC, abstractmethod
 from weakref import WeakValueDictionary
 
@@ -22,7 +24,7 @@ from app.bot.utils.constants import (
 from app.bot.utils.formatting import format_device_count, format_subscription_period
 from app.config import Config
 from app.db.models import Transaction, User
-from app.bot.utils.payment_security import InvalidPayment, validate_order
+from app.bot.utils.payment_security import CheckoutUnavailable, InvalidPayment, payment_snapshot, validate_order
 
 logger = logging.getLogger(__name__)
 _payment_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
@@ -69,9 +71,67 @@ class PaymentGateway(ABC):
         self.i18n = i18n
         self.services = services
 
-    @abstractmethod
-    async def create_payment(self, data: SubscriptionData) -> str:
-        pass
+    async def create_payment(self, data: SubscriptionData, purchase_flow_id: str | None = None) -> str:
+        """One committed reservation owns invoice I/O, across processes/restarts.
+
+        Direct service callers explicitly start a new flow when no identity is
+        supplied. Telegram always supplies the identity from its checkout button.
+        No external invoice retry is attempted, including after a lost response.
+        """
+        flow_id = purchase_flow_id if purchase_flow_id is not None else uuid.uuid4().hex
+        if not isinstance(flow_id, str) or not re.fullmatch(r"[0-9a-f]{32}", flow_id):
+            raise InvalidPayment("invalid purchase flow identity")
+        if (data.state != self.callback or data.user_id <= 0 or data.devices <= 0
+                or data.duration <= 0 or (data.is_extend and data.is_change)):
+            raise InvalidPayment("invalid checkout")
+        amount = await self._invoice_amount(data)
+        async with self.session() as session:
+            transaction, owner = await Transaction.reserve_purchase_flow(
+                session, flow_id, tg_id=data.user_id, subscription=data.pack(),
+                payment_id=str(uuid.uuid4()),
+                **payment_snapshot(self.provider, self.currency.code, amount),
+            )
+        saved = SubscriptionData.unpack(transaction.subscription)
+        # Ignore current catalogue price changes; the original saved order is
+        # authoritative. Different user/tariff/provider cannot reuse this flow.
+        if (transaction.tg_id != data.user_id or transaction.payment_provider != self.provider
+                or any(getattr(saved, key) != getattr(data, key) for key in
+                       ("state", "devices", "duration", "is_extend", "is_change"))):
+            raise InvalidPayment("purchase flow context mismatch")
+        if not owner:
+            if transaction.status == TransactionStatus.PENDING and transaction.payment_url:
+                return transaction.payment_url
+            raise CheckoutUnavailable("Checkout is already being handled or requires review")
+        try:
+            payment_url, payment_id, provider_id = await self._create_invoice(saved, transaction)
+            if not isinstance(payment_url, str) or not payment_url:
+                raise RuntimeError("Missing payment action")
+            async with self.session() as session:
+                finished = await Transaction.finish_invoice(
+                    session, flow_id, payment_id, payment_url, provider_id,
+                )
+            if not finished:
+                raise RuntimeError("Invoice reservation could not be finalized")
+        except Exception:
+            # The reservation is already REVIEW_REQUIRED. Even a failed DB
+            # finalize can follow a committed provider invoice: never recreate.
+            logger.error("Invoice creation needs reconciliation for provider %s", self.provider)
+            raise CheckoutUnavailable("Invoice outcome requires manual review") from None
+        return payment_url
+
+    async def _invoice_amount(self, data: SubscriptionData):
+        return data.price
+
+    async def _create_invoice(self, data: SubscriptionData, transaction):
+        raise NotImplementedError
+
+    async def _notify_payment_review(self, user) -> None:
+        try:
+            locale = user.language_code if user.language_code in self.i18n.locales else DEFAULT_LANGUAGE
+            with self.i18n.context(), self.i18n.use_locale(locale):
+                await self.services.notification.notify_payment_review(user_id=user.tg_id)
+        except Exception:
+            logger.error("Could not send payment review notification")
 
     @abstractmethod
     async def handle_payment_succeeded(self, payment_id: str) -> None:
@@ -158,6 +218,8 @@ class PaymentGateway(ABC):
                             "Payment %s could not transition from PROCESSING to REVIEW_REQUIRED; "
                             "inspect its current state.", payment_id
                         )
+                    else:
+                        await self._notify_payment_review(user)
                 except Exception:
                     logger.error(
                         "Could not mark payment %s for review; stale PROCESSING recovery is required.",
@@ -178,10 +240,12 @@ class PaymentGateway(ABC):
                 )
                 try:
                     async with self.session() as session:
-                        await Transaction.set_status_if_processing(
+                        marked = await Transaction.set_status_if_processing(
                             session=session, payment_id=payment_id,
                             status=TransactionStatus.REVIEW_REQUIRED,
                         )
+                    if marked:
+                        await self._notify_payment_review(user)
                 except Exception:
                     logger.error(
                         "Could not mark payment %s for review after DB completion failure; "

@@ -2,7 +2,6 @@ import base64
 import hashlib
 import json
 import logging
-import uuid
 from hmac import compare_digest
 
 import aiohttp
@@ -16,11 +15,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.models import ServicesContainer, SubscriptionData
 from app.bot.payment_gateways import PaymentGateway
-from app.bot.utils.constants import HELEKET_WEBHOOK, Currency, TransactionStatus
+from app.bot.utils.constants import HELEKET_WEBHOOK, Currency
 from app.bot.utils.navigation import NavSubscription
 from app.config import Config
 from app.db.models import Transaction
-from app.bot.utils.payment_security import InvalidPayment, payment_snapshot, safe_client_ip
+from app.bot.utils.payment_security import InvalidPayment, safe_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +52,10 @@ class Heleket(PaymentGateway):
         self.app.router.add_post(HELEKET_WEBHOOK, self.webhook_handler)
         logger.info("Heleket payment gateway initialized.")
 
-    async def create_payment(self, data: SubscriptionData) -> str:
+    async def _create_invoice(self, data: SubscriptionData, transaction):
         bot_username = (await self.bot.get_me()).username
         redirect_url = f"https://t.me/{bot_username}"
-        order_id = str(uuid.uuid4())
+        order_id = transaction.payment_id
         price = str(data.price)
 
         payload = {
@@ -88,20 +87,8 @@ class Heleket(PaymentGateway):
         if invoice.get("order_id") != order_id or not invoice.get("uuid"):
             raise RuntimeError("Heleket invoice identity mismatch")
 
-        async with self.session() as session:
-            transaction = await Transaction.create(
-                session=session,
-                tg_id=data.user_id,
-                subscription=data.pack(),
-                payment_id=result["result"]["order_id"],
-                status=TransactionStatus.PENDING,
-                **payment_snapshot(self.provider, self.currency.code, price, invoice["uuid"]),
-            )
-            if transaction is None:
-                raise RuntimeError("Could not persist Heleket order")
-
         logger.info("Heleket payment link created.")
-        return pay_url
+        return pay_url, order_id, invoice["uuid"]
 
     async def handle_payment_succeeded(self, payment_id: str) -> None:
         await self._on_payment_succeeded(payment_id)
