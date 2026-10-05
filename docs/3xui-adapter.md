@@ -41,7 +41,8 @@ LEGACY py3xui: NOT USED FOR PANEL RUNTIME OPERATIONS
 LIVE PANEL LIFECYCLE: VERIFIED ON 3.9.0 WITH ONE SYNTHETIC CLIENT; CLEANUP COMPLETE
 
 ServerPoolService owns one adapter/session per server. Startup remains read-only:
-authenticate, require panel 3.8.5/running Xray, validate enabled configured inbound
+authenticate, require panel version in the explicit allowlist {3.8.5, 3.9.0}
+(with optional leading v) and running Xray, validate enabled configured inbound
 and known protocol. Failed candidates, refreshed connections and shutdown sessions
 are closed. Existing server selection is preserved; no first-inbound fallback.
 py3xui 0.3.2 remains locked for historical audit tests, with no runtime imports.

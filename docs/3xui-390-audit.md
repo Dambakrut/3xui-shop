@@ -174,7 +174,8 @@ is removed; see [safe live evidence](3xui-live-write-smoke.md). New production
 requests still require separate explicit authorization. No HTTP subscription
 fetch, VPN handshake, Telegram E2E or payment pilot was performed.
 
-The runtime ServerPoolService TARGET_PANEL_VERSION remains 3.8.5; this audit and
-standalone 3.9.0 smoke do not change its startup version gate. A separately reviewed
-runtime target change is needed before normal shop startup against 3.9.0.
+After the controlled lifecycle, the runtime ServerPoolService version guard uses
+SUPPORTED_PANEL_VERSIONS = {3.8.5, 3.9.0} (optional leading v is normalized).
+Any other version, including 3.9.1 and future releases, remains unavailable.
+This is an explicit allowlist, not a minimum-version range.
 Historical CREATE_REVIEW remains historical; it is not reused or promoted.

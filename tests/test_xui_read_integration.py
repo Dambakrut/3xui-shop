@@ -180,6 +180,42 @@ class ServerPoolReadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.pool._servers, {})
                 adapter.close.assert_awaited_once()
 
+    async def test_explicit_supported_panel_versions_accepted(self):
+        from app.bot.services import server_pool as module
+        from app.db.models import Server
+
+        self.assertEqual(module.SUPPORTED_PANEL_VERSIONS, frozenset({"3.8.5", "3.9.0"}))
+        for version in ("3.8.5", "3.9.0", "v3.8.5", "v3.9.0"):
+            adapter = self.fake_adapter(panel_version=version)
+            with self.subTest(version=version), \
+                 patch.object(module, "XUIAdapter", return_value=adapter), \
+                 patch.object(Server, "update", new=AsyncMock()):
+                await self.pool._add_server(self.server)
+                self.assertTrue(self.server.online)
+                self.assertIs(self.pool._servers[7].adapter, adapter)
+                adapter.list_inbounds.assert_awaited_once()
+                await self.pool.close()
+                adapter.close.assert_awaited_once()
+
+    async def test_other_and_malformed_panel_versions_fail_closed(self):
+        from app.bot.services import server_pool as module
+        from app.db.models import Server
+
+        for version in ("3.9.1", "3.10.0", "4.0.0", "", "garbage", "3.9", "3.9.0-beta", " 3.9.0", None):
+            adapter = self.fake_adapter(panel_version=version)
+            with self.subTest(version=version), \
+                 patch.object(module, "XUIAdapter", return_value=adapter), \
+                 patch.object(Server, "update", new=AsyncMock()), \
+                 patch.object(module.logger, "error") as error_log:
+                await self.pool._add_server(self.server)
+                self.assertFalse(self.server.online)
+                self.assertEqual(self.pool._servers, {})
+                adapter.list_inbounds.assert_not_awaited()
+                adapter.close.assert_awaited_once()
+            error_log.assert_called_once()
+            self.assertIn("unsupported panel version", error_log.call_args.args[0])
+            self.assertEqual(error_log.call_args.args[-1], "3.8.5, 3.9.0")
+
     async def test_auth_status_version_and_xray_failures_unavailable(self):
         from app.bot.services import server_pool as module
         from app.db.models import Server

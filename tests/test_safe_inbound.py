@@ -78,7 +78,7 @@ class SafeInboundTests(unittest.IsolatedAsyncioTestCase):
             dataclass=dataclass, logging=logging, logger=logging.getLogger("safe-inbound-test"),
             Server=self.server_model, User=self.user_model,
             XUIAdapter=Mock(return_value=self.adapter), XUIAuthMode=FakeAuthMode,
-            TARGET_PANEL_VERSION="3.8.5", KNOWN_PROTOCOLS=frozenset({"vless"}),
+            SUPPORTED_PANEL_VERSIONS=frozenset({"3.8.5", "3.9.0"}), KNOWN_PROTOCOLS=frozenset({"vless"}),
         )
         load_definitions("app/bot/services/server_pool.py", {"Connection", "ServerPoolService"}, pool_ns)
         self.pool = pool_ns["ServerPoolService"](self.config, SessionContext)

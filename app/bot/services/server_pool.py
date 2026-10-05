@@ -12,7 +12,7 @@ KNOWN_PROTOCOLS = frozenset({
     "vmess", "vless", "trojan", "shadowsocks", "wireguard", "hysteria",
     "http", "mixed", "tunnel", "tun", "mtproto", "amneziawg", "tuic",
 })
-TARGET_PANEL_VERSION = "3.8.5"
+SUPPORTED_PANEL_VERSIONS = frozenset({"3.8.5", "3.9.0"})
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,10 @@ class ServerPoolService:
                 )
                 await adapter.authenticate()
                 status = await adapter.get_server_status()
-                if status.panel_version.removeprefix("v") != TARGET_PANEL_VERSION:
-                    logger.error("Server %s has unsupported panel version %r", server.id, status.panel_version)
+                if (not isinstance(status.panel_version, str)
+                        or status.panel_version.removeprefix("v") not in SUPPORTED_PANEL_VERSIONS):
+                    logger.error("Server %s has unsupported panel version %r; supported versions: %s",
+                                 server.id, status.panel_version, ", ".join(sorted(SUPPORTED_PANEL_VERSIONS)))
                     server.online = False
                 elif status.xray_state != "running":
                     logger.error("Server %s reports Xray state %r", server.id, status.xray_state)
