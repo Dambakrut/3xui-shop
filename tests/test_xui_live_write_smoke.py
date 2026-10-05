@@ -31,6 +31,20 @@ class SmokeJournalTests(unittest.TestCase):
         with self.assertRaises(smoke.SmokeError):
             state.validate(replace(self.config, host="https://another-panel.example/base"))
 
+    def test_fresh_390_identity_expiry_defaults_and_historical_state_rejected(self):
+        before = int(smoke.datetime.now(smoke.timezone.utc).timestamp() * 1000)
+        state = smoke.SmokeState.generate(self.config)
+        self.assertTrue(state.email.startswith("shop-smoke-390-"))
+        self.assertEqual(state.panel_version, "3.9.0")
+        self.assertEqual(state.reset_weekday, 0)
+        self.assertGreaterEqual(state.initial_expiry, before + 3 * smoke.DAY_MS)
+        self.assertEqual(state.updated_expiry, state.initial_expiry + smoke.DAY_MS)
+        self.assertEqual(state.create_request().client_payload()["resetWeekday"], 0)
+        for changes in ({"email": state.email.replace("390-", "")},
+                        {"panel_version": "3.8.5"}, {"reset_weekday": True}, {"reset_weekday": 1}):
+            with self.subTest(changes=changes), self.assertRaises(smoke.SmokeError):
+                replace(state, **changes).validate(self.config)
+
     def test_state_roundtrip_no_token_or_links_and_corruption_never_regenerates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -151,12 +165,13 @@ class LiveWriteWireTests(unittest.IsolatedAsyncioTestCase):
         from aiohttp import web
 
         self.inbound = json.loads((Path(__file__).parent / "fixtures/xui/v3_8_5/inbound_xhttp.json").read_text())
+        self.inbound["excludeFromSub"] = False
         self.record = None
         self.memberships = [6]
         self.physical = []
         self.behavior = "normal"
         self.pending = False
-        self.panel_version = "3.8.5"
+        self.panel_version = "3.9.0"
         self.created_snapshot = None
 
         async def handler(request):
@@ -173,7 +188,8 @@ class LiveWriteWireTests(unittest.IsolatedAsyncioTestCase):
                 if self.behavior == "missing_route":
                     return web.Response(status=404)
                 if self.behavior == "drop_get":
-                    request.transport.close()
+                    if request.transport is not None:
+                        request.transport.close()
                     return web.Response()
                 if self.record is None:
                     return web.json_response({"success": False, "msg": "record not found", "obj": None})
@@ -210,7 +226,8 @@ class LiveWriteWireTests(unittest.IsolatedAsyncioTestCase):
                 if self.behavior == "malformed":
                     return web.Response(text="invalid JSON")
                 if self.behavior == "drop_commit":
-                    request.transport.close()
+                    if request.transport is not None:
+                        request.transport.close()
                     return web.Response()
                 if self.behavior == "unknown_obj":
                     return web.json_response({"success": True, "obj": {}})
@@ -302,13 +319,27 @@ class LiveWriteWireTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result["mutation_response_metadata"]["valid_mutation_response"])
 
     async def test_wrong_version_or_disabled_inbound_stops_preflight(self):
-        self.panel_version = "3.9.0"
+        self.panel_version = "3.8.5"
         self.assertEqual((await self.run_stage("preflight"))["outcome"], "FAIL")
         self.assertEqual(len(self.physical), 1)
-        self.panel_version = "3.8.5"
+        self.panel_version = "3.9.0"
         self.inbound["enable"] = False
         self.assertEqual((await self.run_stage("preflight"))["outcome"], "FAIL")
         self.assertEqual(self.mutations(), [])
+
+    async def test_excluded_or_missing_visibility_blocks_preflight(self):
+        for value in (True, None, 0):
+            self.inbound["excludeFromSub"] = value
+            self.assertEqual((await self.run_stage("preflight"))["outcome"], "FAIL")
+        self.assertEqual(self.mutations(), [])
+
+    async def test_weekday_change_blocks_update_without_post(self):
+        await self.prepare_and_create()
+        self.assertEqual((await self.run_stage("verify-create"))["outcome"], "PASS")
+        self.record["resetWeekday"] = 1
+        count = len(self.mutations())
+        self.assertEqual((await self.run_stage("update"))["outcome"], "FAIL")
+        self.assertEqual(len(self.mutations()), count)
 
     async def test_existing_test_email_blocks_preflight_and_create(self):
         self.store(self.state.create_request().client_payload())
@@ -481,6 +512,17 @@ class LiveWriteWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mutations()[-1][:2], ("POST", f"/base/panel/api/clients/del/{self.state.email}"))
         self.assertIsNone(self.record)
         self.assertEqual((await self.run_stage("verify-cleanup"))["outcome"], "PASS")
+
+    async def test_recorded_cleanup_pass_is_terminal_and_roundtrips(self):
+        self.state = replace(self.state, stage="CLEANUP_PASS")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            smoke.save_state(path, self.state)
+            self.assertEqual(smoke.load_state(path, self.config), self.state)
+        for stage in ("create", "update", "cleanup"):
+            with self.subTest(stage=stage), self.assertRaises(smoke.SmokeError):
+                await self.run_stage(stage)
+        self.assertEqual(self.physical, [])
 
     async def test_ambiguous_cleanup_after_commit_no_retry(self):
         await self.prepare_and_create()

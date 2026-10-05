@@ -162,8 +162,12 @@ def planned_summary(config: SmokeConfig) -> dict:
     }
 
 
-async def run_smoke(config: SmokeConfig, *, dry_run: bool) -> dict:
+async def run_smoke(config: SmokeConfig, *, dry_run: bool,
+                    expected_panel_version: str = "3.8.5") -> dict:
+    if expected_panel_version not in ("3.8.5", "3.9.0"):
+        raise SmokeError("Unsupported expected panel version")
     summary = planned_summary(config)
+    summary["expected_panel_version"] = expected_panel_version
     if dry_run:
         return safe_summary(summary, (config.token, config.sub_id or ""))
     summary.update(mode="LIVE_READ_ONLY", outcome="FAIL")
@@ -176,7 +180,7 @@ async def run_smoke(config: SmokeConfig, *, dry_run: bool) -> dict:
                 "panel_version": status.panel_version, "xray_version": status.xray_version,
                 "xray_state": status.xray_state,
             }
-            if status.panel_version.removeprefix("v") != "3.8.5":
+            if status.panel_version.removeprefix("v") != expected_panel_version:
                 raise SmokeError("Panel version mismatch; stopped")
             if status.xray_version != "26.9.30":
                 raise SmokeError("Xray version mismatch; stopped")
@@ -200,8 +204,21 @@ async def run_smoke(config: SmokeConfig, *, dry_run: bool) -> dict:
                           and settings.get("security") in ("tls", "reality")
                           and inbound.raw.get("disableFlow") is False)
             summary["inbound"]["vision_compatible"] = compatible
-            if not compatible:
+            if expected_panel_version == "3.8.5" and not compatible:
                 raise SmokeError("Shop Vision assumptions are not confirmed; stopped")
+            if expected_panel_version == "3.9.0":
+                from app.bot.services.vpn import VPNService, VPNReadError
+                try:
+                    summary["inbound"]["resolved_flow"] = VPNService._validate_provisioning_capability(inbound, None)
+                except VPNReadError:
+                    raise SmokeError("Shop capability policy rejected inbound; stopped") from None
+            if expected_panel_version == "3.9.0":
+                excluded = inbound.raw.get("excludeFromSub")
+                if type(excluded) is not bool:
+                    raise SmokeError("Subscription visibility field missing or invalid; stopped")
+                summary["inbound"]["excludeFromSub"] = excluded
+                if excluded:
+                    raise SmokeError("Configured inbound is excluded from subscriptions; stopped")
             if config.client_email:
                 stage = "client"
                 client = await adapter.get_client(config.client_email)
@@ -261,12 +278,15 @@ def load_local_env() -> dict[str, str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Validate and plan; no HTTP session")
+    parser.add_argument("--panel-version", choices=("3.8.5", "3.9.0"), default="3.8.5",
+                        help="Explicit expected version; no automatic version fallback")
     args = parser.parse_args(argv)
     # Prevent inherited DEBUG configuration exposing HTTP/personal data.
     logging.disable(logging.CRITICAL)
     try:
         config = SmokeConfig.from_env(load_local_env())
-        summary = asyncio.run(run_smoke(config, dry_run=args.dry_run))
+        summary = asyncio.run(run_smoke(config, dry_run=args.dry_run,
+                                      expected_panel_version=args.panel_version))
     except (SmokeError, XUIError, ValueError, OSError) as error:
         print(json.dumps({"outcome": "FAIL", "error_type": type(error).__name__,
                           "reason": "Smoke config/runtime validation failed; no fallback"}))

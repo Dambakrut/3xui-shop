@@ -35,16 +35,16 @@ from app.integrations.xui import (
 from scripts.xui_live_readonly_smoke import SmokeConfig, SmokeError, load_local_env, redact
 from app.integrations.xui.models import XUIMutationResponseMetadata
 
-STATE_PATH = ROOT / ".xui-write-smoke-state.json"
-LOCK_PATH = ROOT / ".xui-write-smoke-state.lock"
-OUTCOME_PATH = ROOT / ".xui-write-smoke-outcome.json"
+STATE_PATH = ROOT / ".xui-write-smoke-390-state.json"
+LOCK_PATH = ROOT / ".xui-write-smoke-390-state.lock"
+OUTCOME_PATH = ROOT / ".xui-write-smoke-390-outcome.json"
 DAY_MS = 86400000
 STAGES = ("dry-run", "preflight", "create", "verify-create", "update",
           "verify-update", "cleanup", "verify-cleanup")
 STATES = frozenset({"PREPARED", "PREFLIGHT_PASS", "CREATE_ATTEMPTED", "CREATE_PASS",
     "CREATE_REVIEW", "VERIFY_CREATE_PASS", "UPDATE_ATTEMPTED", "UPDATE_PASS",
     "UPDATE_REVIEW", "VERIFY_UPDATE_PASS", "CLEANUP_ATTEMPTED", "CLEANUP_REVIEW",
-    "CLEANUP_PERSISTED", "VERIFY_CLEANUP_PASS"})
+    "CLEANUP_PERSISTED", "CLEANUP_PASS", "VERIFY_CLEANUP_PASS"})
 
 
 def host_binding(config: SmokeConfig) -> str:
@@ -60,14 +60,18 @@ class SmokeState:
     initial_expiry: int
     updated_expiry: int
     host_digest: str
+    panel_version: str = "3.9.0"
+    reset_weekday: int = 0
     stage: str = "PREPARED"
     preservation_digest: str = ""
 
     def validate(self, config: SmokeConfig) -> None:
         if config.inbound_id != 6 or type(self.inbound_id) is not int or self.inbound_id != 6:
             raise SmokeError("This smoke is restricted to inbound 6")
-        if not isinstance(self.email, str) or not re.fullmatch(r"shop-smoke-\d{14}-[0-9a-f]{8}", self.email):
+        if not isinstance(self.email, str) or not re.fullmatch(r"shop-smoke-390-\d{14}-[0-9a-f]{8}", self.email):
             raise SmokeError("Unsafe smoke email; exact synthetic prefix is required")
+        if self.panel_version != "3.9.0" or type(self.reset_weekday) is not int or self.reset_weekday != 0:
+            raise SmokeError("This trial requires panel 3.9.0 and resetWeekday=0")
         try:
             valid = all(str(UUID(value)) == value and UUID(value).version == 4
                         for value in (self.uuid, self.sub_id))
@@ -86,16 +90,17 @@ class SmokeState:
     def generate(cls, config: SmokeConfig) -> SmokeState:
         credential = str(uuid4())
         now = datetime.now(timezone.utc)
-        state = cls(f"shop-smoke-{now:%Y%m%d%H%M%S}-{credential[:8]}", credential,
-                    credential, 6, int(now.timestamp() * 1000) + DAY_MS,
-                    int(now.timestamp() * 1000) + 2 * DAY_MS, host_binding(config))
+        state = cls(f"shop-smoke-390-{now:%Y%m%d%H%M%S}-{credential[:8]}", credential,
+                    credential, 6, int(now.timestamp() * 1000) + 3 * DAY_MS,
+                    int(now.timestamp() * 1000) + 4 * DAY_MS, host_binding(config))
         state.validate(config)
         return state
 
     def create_request(self) -> XUIClientWrite:
         return XUIClientWrite(email=self.email, uuid=self.uuid, inbound_ids=(6,),
             expiry_time_ms=self.initial_expiry, total_bytes=0, limit_ip=1,
-            limit_hwid=0, tg_id=0, sub_id=self.sub_id, flow="", enable=True)
+            limit_hwid=0, tg_id=0, sub_id=self.sub_id, flow="", enable=True,
+            preserved={"resetWeekday": self.reset_weekday})
 
 
 def save_state(path: Path, state: SmokeState) -> None:
@@ -138,7 +143,6 @@ def plan(config: SmokeConfig, state: SmokeState, stage: str) -> list[tuple[str, 
              ("GET", f"panel/api/clients/get/{quote(state.email, safe='')}")]
     if stage in ("verify-create", "verify-update"):
         reads += [("GET", f"panel/api/clients/traffic/{state.email}"),
-                  ("POST", "panel/api/setting/all"),
                   ("GET", f"panel/api/clients/subLinks/{state.sub_id}")]
     mutation = {"create": "panel/api/clients/add", "update": f"panel/api/clients/update/{state.email}",
                 "cleanup": f"panel/api/clients/del/{state.email}"}.get(stage)
@@ -157,8 +161,8 @@ def planned_summary(config: SmokeConfig, state: SmokeState) -> dict:
                          state.initial_expiry / 1000, timezone.utc).isoformat(),
                      "updated_expiry_utc": datetime.fromtimestamp(
                          state.updated_expiry / 1000, timezone.utc).isoformat(),
-                     "flow": "", "enable": True, "limitIp": 1, "limitHwid": 0, "totalGB": 0},
-        "journal_stage": state.stage, "required_token_scope": "admin"}
+                     "resetWeekday": state.reset_weekday, "flow": "", "enable": True, "limitIp": 1, "limitHwid": 0, "totalGB": 0},
+        "panel_version_target": state.panel_version, "journal_stage": state.stage, "required_token_scope": "admin"}
 
 
 def assert_identity(client, state: SmokeState) -> None:
@@ -281,7 +285,7 @@ class WriteSmokeAdapter(XUIAdapter):
 
 async def validate_panel(adapter: WriteSmokeAdapter):
     status = await adapter.get_server_status()
-    if status.panel_version.removeprefix("v") != "3.8.5" or status.xray_state != "running":
+    if status.panel_version.removeprefix("v") != adapter.state.panel_version or status.xray_state != "running":
         raise SmokeError("Panel version/running status mismatch")
     if status.xray_version.removeprefix("v") != "26.9.30":
         raise SmokeError("Xray version mismatch")
@@ -290,7 +294,9 @@ async def validate_panel(adapter: WriteSmokeAdapter):
             or (inbound.stream_settings or {}).get("network") != "xhttp"
             or VPNService._validate_provisioning_capability(inbound, "") != ""):
         raise SmokeError("Production trial requires supported VLESS Reality XHTTP")
-    return {"panel": "3.8.5", "xray": "26.9.30", "inbound": 6,
+    if inbound.raw.get("excludeFromSub") is not False:
+        raise SmokeError("Inbound subscription visibility is missing or excluded")
+    return {"panel": adapter.state.panel_version, "excludeFromSub": False, "xray": "26.9.30", "inbound": 6,
             "enabled": True, "protocol": "vless", "security": "reality", "network": "xhttp"}
 
 
@@ -305,8 +311,11 @@ async def require_absent(adapter, state):
 def verify_client(client, state, expiry):
     assert_identity(client, state)
     if (client.expiry_time_ms != expiry or not client.enable or client.flow != ""
-            or client.limit_ip != 1 or client.limit_hwid != 0 or client.total_bytes != 0):
+            or client.limit_ip != 1 or client.limit_hwid != 0 or client.total_bytes != 0
+            or type(client.raw.get("resetWeekday")) is not int
+            or client.raw.get("resetWeekday") != state.reset_weekday):
         raise SmokeError("Canonical smoke state differs from intended state")
+    preservation_digest(client)  # Local full serializer validation; no network/write.
 
 
 def verify_links(links, state):
@@ -362,7 +371,7 @@ async def run_stage(config: SmokeConfig, state: SmokeState, stage: str,
         "update": {"VERIFY_CREATE_PASS"},
         "verify-update": {"UPDATE_PASS", "UPDATE_REVIEW", "UPDATE_ATTEMPTED", "VERIFY_UPDATE_PASS"},
         "cleanup": STATES - {"PREPARED", "PREFLIGHT_PASS", "CLEANUP_ATTEMPTED", "CLEANUP_REVIEW",
-                              "CLEANUP_PERSISTED", "VERIFY_CLEANUP_PASS"},
+                              "CLEANUP_PERSISTED", "CLEANUP_PASS", "VERIFY_CLEANUP_PASS"},
         "verify-cleanup": {"CLEANUP_ATTEMPTED", "CLEANUP_REVIEW", "CLEANUP_PERSISTED", "VERIFY_CLEANUP_PASS"},
     }
     if stage not in allowed_states or state.stage not in allowed_states[stage]:
@@ -372,13 +381,15 @@ async def run_stage(config: SmokeConfig, state: SmokeState, stage: str,
     summary = {"stage": stage, "outcome": "FAIL"}
     async with adapter_factory(config, state, stage) as adapter:
         try:
+            if fetch_http:
+                adapter.allowed = adapter.allowed | {("POST", "panel/api/setting/all")}
             summary["preflight"] = await validate_panel(adapter)
             if stage in ("preflight", "create"):
                 await require_absent(adapter, state)
                 if state.initial_expiry <= int(datetime.now(timezone.utc).timestamp() * 1000) + 60000:
                     raise SmokeError("Prepared expiry is stale; do not recreate identity automatically")
-                if state.initial_expiry > int(datetime.now(timezone.utc).timestamp() * 1000) + DAY_MS + 60000:
-                    raise SmokeError("Prepared expiry exceeds the one-day trial limit")
+                if state.initial_expiry > int(datetime.now(timezone.utc).timestamp() * 1000) + 3 * DAY_MS + 60000:
+                    raise SmokeError("Prepared expiry exceeds the three-day trial limit")
                 if stage == "preflight":
                     persist(replace(state, stage="PREFLIGHT_PASS"))
                 else:
@@ -387,6 +398,7 @@ async def run_stage(config: SmokeConfig, state: SmokeState, stage: str,
                     persist(state)  # A crash after this point cannot replay create.
                     adapter.arm_mutation({"client": desired.client_payload(), "inboundIds": [6]})
                     result = await adapter.add_client(desired)
+                    verify_client(result.client, state, state.initial_expiry)
                     confirmed = result.node_pending is False and adapter.mutation_count == 1
                     state = replace(state, stage="CREATE_PASS" if confirmed else "CREATE_REVIEW",
                                     preservation_digest=preservation_digest(result.client))
@@ -403,14 +415,16 @@ async def run_stage(config: SmokeConfig, state: SmokeState, stage: str,
                 traffic = await adapter.get_client_traffic(state.email)
                 if traffic is None:
                     raise SmokeError("Traffic record missing")
-                uri = await adapter.get_subscription_base_url()
+                if traffic.email != state.email or traffic.enable != client.enable:
+                    raise SmokeError("Traffic identity/status mismatch")
+                if "resetWeekday" in traffic.raw and (type(traffic.raw["resetWeekday"]) is not int
+                        or traffic.raw["resetWeekday"] != state.reset_weekday):
+                    raise SmokeError("Traffic resetWeekday mismatch")
                 links = await adapter.get_subscription_links(state.sub_id)
                 summary["share_links_verified"] = verify_links(links, state)
                 summary["traffic_read"] = True  # traffic.id is never credential identity.
-                parsed = urlsplit(uri)
-                summary["subscription_base"] = {"scheme": parsed.scheme, "hostname": parsed.hostname,
-                                                "path": parsed.path}
                 if fetch_http:
+                    uri = await adapter.get_subscription_base_url()
                     summary["http_subscription_verified"] = await fetch_subscription(adapter, uri, state)
                 else:
                     summary["http_subscription_verified"] = "NOT RUN (explicit --fetch-subscription required)"

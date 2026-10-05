@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "msg": "",
+  "obj": {
+    "subURI": "https://sub.example/custom/sub/",
+    "subPath": "/custom/sub/",
+    "subEnable": true
+  }
+}

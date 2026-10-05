@@ -1,218 +1,133 @@
-# 3x-ui 3.8.5 controlled write smoke — create persisted, activation needs review
+# Controlled 3x-ui client lifecycle smoke
 
-Target: panel 3.8.5, Xray 26.9.30, Bearer admin token, inbound 6,
-VLESS + Reality + XHTTP, empty flow. No Telegram/payment runtime is started.
+## Completed v3.9.0 trial - 2026-10-05
 
-## Recorded production stages
+Target: 3x-ui 3.9.0, Xray Core 26.9.30 running, Bearer admin authentication,
+inbound 6 enabled with VLESS / Reality / XHTTP, flow="", disableFlow=false,
+excludeFromSub=false. No Telegram/payment runtime was started.
 
-| Stage | Result |
-|---|---|
-| PREPARED / dry-run | PASS, 2026-10-02; network requests = 0 |
-| PREFLIGHT | PASS, 2026-10-02; exactly 3 authorized GET requests |
-| CREATE | REVIEW — canonical persistence confirmed; nodePending unknown |
-| VERIFY CREATE | PASS — GET-only persistence/traffic/share-link verification; activation still UNKNOWN |
-| UPDATE | NOT RUN |
-| VERIFY UPDATE | NOT RUN |
-| CLEANUP | NOT RUN |
-| VERIFY CLEANUP | NOT RUN |
-| HTTP subscription fetch / VPN handshake | NOT RUN |
+All stages had separate operator approval. The test client was deleted.
+Production actions are finished; this report does not authorize another run.
 
-PRODUCTION READS: 13. PRODUCTION WRITES: 1 (cumulative preflight + create + investigation).
+| Stage | Result | GET | POST |
+|---|---|---:|---:|
+| Preparation / dry-run | PREPARED, network requests 0 | 0 | 0 |
+| Preflight | PREFLIGHT_PASS; synthetic client absent | 3 | 0 |
+| Create | CREATE_PASS; canonical persistence confirmed | 5 | 1 |
+| Verify create | VERIFY_CREATE_PASS | 5 | 0 |
+| Update | UPDATE_PASS; only expiry changed | 5 | 1 |
+| Verify update | VERIFY_UPDATE_PASS | 5 | 0 |
+| Cleanup | CLEANUP_PASS; canonical NOT FOUND | 2 | 1 |
+| Total for this lifecycle | Complete | 25 | 3 |
 
-Approved preflight confirmed Bearer authentication, panel 3.8.5, Xray 26.9.30
-running, enabled inbound 6 with VLESS/Reality/XHTTP and passing shop capability
-policy. Exact synthetic test email was NOT FOUND. Journal is PREFLIGHT_PASS.
-The standalone preflight performed no POST, retry or fallback auth.
+The earlier independent v3.9.0 status/inbound smoke made two GET requests.
+An earlier GET for the historical, manually removed client returned not-found;
+that is not an API regression and is not part of this new lifecycle.
 
-Separately approved CREATE ran once: 6 panel requests (5 GET + 1 POST /clients/add).
-Canonical reconciliation GET confirmed the exact intended test identity and state:
-membership [6], enable=true, flow="", limitIp=1, limitHwid=0, quota=0 and planned expiry.
-Mutation response did not provide a confirmed nodePending boolean to the smoke;
-the current instrumentation does not distinguish a lost/error response from a
-successful response with no usable outcome object. Persistence is confirmed,
-activation UNKNOWN. Journal is CREATE_REVIEW (manual review required).
-Retries=0, redirects=0, fallback=0, login/CSRF=0, subscription requests=0.
-Stopped immediately after create reconciliation. No verify-create stage, update,
-subscription fetch or cleanup occurred. No further production action is authorized.
+Create and update each received HTTP 200, a valid success=true envelope and
+obj=null. Under the verified pendingNodeObj contract this means node_pending=false.
+Both canonical reconciliation reads confirmed the intended persisted state.
+Read verification confirmed exact UUID/subId, memberships [6], flow="", enable=true,
+limitIp=1, limitHwid=0, totalGB=0, resetWeekday integer 0 and preservation hash.
+Expiry changed from 2026-10-08T14:46:34.486Z to 2026-10-09T14:46:34.486Z.
 
-## Separately approved GET-only verify investigation
+Traffic was readable, enabled, with up/down/total all zero. Numeric traffic ID
+was never used as credential identity. Each verification found one matching
+VLESS / XHTTP / Reality share link with exact UUID and no Vision flow. Full links
+and production payloads were not stored. HTTP subscription fetch and VPN handshake
+were NOT RUN; panel/share-link success does not prove end-to-end VPN connectivity.
 
-Performed 5 GET requests: server status, inbound list, exact canonical client,
-exact client traffic and subLinks for the state-file subId. POST=0, retries=0,
-settings/all NOT RUN, HTTP subscription fetch NOT RUN. The stock verification's
-settings POST was excluded by a stricter GET-only guard.
+Cleanup made only canonical GET, one POST delete, then canonical GET. Its valid
+HTTP 200 success=true,obj=null acknowledges handler success. NOT FOUND confirms
+persistence deletion; node activation/synchronization remains UNKNOWN.
+The ignored new journal is CLEANUP_PASS. No automatic further stage is authorized.
 
-Canonical identity matches state UUID/subId (redacted above), memberships exactly
-[6], flow="", enable=true, limitIp=1, limitHwid=0, totalGB=0 and expiry exactly the
-planned initial value. Preservation hash matches. Traffic read PASS (numeric ID
-used only as traffic record identity; up/down/total=0). One VLESS share link passed
-UUID/XHTTP/Reality/empty-flow checks; no link or response body was saved.
-Panel/core/inbound safety validation also passed. Journal remains CREATE_REVIEW.
-UPDATE NOT READY. No additional mutation was performed or authorized.
+## Historical v3.8.5 trial
 
-Create response classification: UNKNOWN. Original HTTP status, response-received
-flag, success envelope and obj presence/type were not retained by instrumentation.
-The null nodePending result alone cannot distinguish successful null obj from
-transport/protocol/API error followed by successful canonical reconciliation.
+The old create persisted, but original response metadata was not retained and its
+journal remains CREATE_REVIEW. It was never automatically reclassified by 6D.1.
+The operator manually deleted that old client. The new v3.9.0 lifecycle has a
+separate identity/journal and does not use historical ambiguity as evidence.
 
-Important source correction: the original audit did not inspect pendingNodeObj
-fully. Official v3.8.5
-[pendingNodeObj](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/util.go)
-returns {nodePending:true} only for pending=true; otherwise nil. A valid success
-response without a nodePending field is therefore part of the normal upstream
-contract, not automatically a transport fault.
-[Create controller](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go)
-uses that helper. The shop's explicit-false-only acceptance and synthetic tests do
-not represent this complete contract. Runtime policy is not changed by this
-investigation, and source evidence does not reconstruct the missing real response
-or prove activation. No automatic promotion to CREATE_PASS is allowed.
+## Endpoint and approval contract
 
-## Prepared plan
-
-Synthetic email: `shop-smoke-20261002194630-cb104e5f`.
-UUID/subId: `cb104e5f…e371` (same generated UUID4, matching shop contract).
-Membership exactly [6], enable=true, flow="", quota=0 bytes/unlimited,
-limitIp=1, limitHwid=0, tgId=0 (no real Telegram user).
-Initial expiry: 2026-10-03 19:46:30.600 UTC.
-Updated expiry: 2026-10-04 19:46:30.600 UTC.
-
-Preflight allowlist, exactly one request per endpoint:
+All paths use a placeholder, not a production hostname/base path or identity.
 
 ```text
-GET /UKr0zLQHQLTGV91xmI/panel/api/server/status
-GET /UKr0zLQHQLTGV91xmI/panel/api/inbounds/list
-GET /UKr0zLQHQLTGV91xmI/panel/api/clients/get/shop-smoke-20261002194630-cb104e5f
+GET /<base>/panel/api/server/status
+GET /<base>/panel/api/inbounds/list
+GET /<base>/panel/api/clients/get/{smoke-email}
+GET /<base>/panel/api/clients/traffic/{smoke-email}
+GET /<base>/panel/api/clients/subLinks/{state-subId}
+POST /<base>/panel/api/clients/add
+POST /<base>/panel/api/clients/update/{smoke-email}
+POST /<base>/panel/api/clients/del/{smoke-email}
 ```
 
-Planned mutations (none executed):
+Run scripts/xui_live_write_smoke.py manually in the locked Python 3.12 environment.
+Required env: XUI_HOST, XUI_AUTH_MODE=token, XUI_API_TOKEN, XUI_INBOUND_ID=6.
+.env must be ignored and untracked. --dry-run generates the new identity only if
+its separate state file does not exist. Missing/corrupt state blocks network stages.
+Network stages require matching --confirm-stage plus separate user approval;
+one command never chains mutations. --dry-run alone performs no network operation.
 
-```text
-POST /UKr0zLQHQLTGV91xmI/panel/api/clients/add
-POST /UKr0zLQHQLTGV91xmI/panel/api/clients/update/shop-smoke-20261002194630-cb104e5f
-POST /UKr0zLQHQLTGV91xmI/panel/api/clients/del/shop-smoke-20261002194630-cb104e5f
-```
+The fresh state pins panel 3.9.0, exact prefix shop-smoke-390-, uuid4 credentials,
+inbound 6, initial expiry +3 days, update +1 day, and resetWeekday=0 (no weekly mode).
+Preflight checks running core, exact version, enabled compatible inbound, empty
+resolved/global flow, excludeFromSub=false and canonical client absence.
 
-## Operator stages and approval boundary
+Every stage has an exact identity-bound method/path allowlist. At most one armed
+mutation is allowed; its body is compared with the expected serializer output.
+Before update/delete, canonical identity and membership are checked. Update
+changes only expiry and preserves all allowlisted fields; snapshot/preservation
+hash checks reject intervening edits. Live cleanup additionally checked flow,
+enable, weekday and updated expiry before deletion.
 
-Run `scripts/xui_live_write_smoke.py` manually in the locked Python 3.12 env.
-Required env: XUI_HOST (HTTPS with panel base path), XUI_AUTH_MODE=token,
-XUI_API_TOKEN, XUI_INBOUND_ID=6. Local .env must be ignored and untracked.
-Optional readonly-smoke targets are not used as write identities.
+TLS verification stays enabled; redirects, cookies, environment proxies,
+session login/CSRF, auth fallback and mutation retries are disabled. Locked aiohttp
+implicit idempotent retries are disabled for the sequential requests too.
+Distinct canonical pre-check/reconciliation GETs are not request retries.
 
-`--dry-run` generates the local identity/journal only on its first run.
-Subsequent runs reuse the same validated identity. All network stages require
-`--confirm-stage <matching-stage>` as an explicit operator assertion. This flag
-does not replace the user's separate approval for each production stage.
+Verification normally uses GET only: safety reads, canonical, traffic, subLinks.
+An optional separately approved --fetch-subscription can additionally read
+settings via POST /panel/api/setting/all and GET the HTTP subscription URL.
+That option was not used live. The HTTP subscription read can update access/HWID
+bookkeeping and must not be implied by approval for panel reads.
 
-After approval for preflight only:
+## Response contract and safe instrumentation
 
-```powershell
-.\.venv-runtime-test\Scripts\python.exe scripts/xui_live_write_smoke.py --preflight --confirm-stage preflight
-```
+Official v3.8.5/v3.9.0
+[helpers](https://github.com/MHSanaei/3x-ui/blob/v3.9.0/internal/web/controller/util.go)
+and [client handlers](https://github.com/MHSanaei/3x-ui/blob/v3.9.0/internal/web/controller/client.go):
+add/update use pendingNodeObj(false) -> nil, pendingNodeObj(true) -> {nodePending:true}.
+Received valid success with obj=null means false. Explicit true means review.
+Unknown objects, lost/malformed/error responses plus canonical desired state mean
+persistence confirmed but node_pending=None; no second POST is sent.
 
-Other separately approved stages: --create, --verify-create, --update,
---verify-update, --cleanup, --verify-cleanup. Each requires its matching confirmation.
-One command never chains mutations. Identity and planned mutation paths are
-shown redacted before any network operation.
+Delete uses jsonMsg, not pendingNodeObj: null does not establish absence of node
+pending work. It deletes canonical client and all attachments, not one membership.
+The smoke therefore requires exact membership [6] before the only delete request.
+Ambiguous delete is reconciled with one canonical GET, never replayed.
 
-The ignored .xui-write-smoke-state.json stores only synthetic email/UUID/subId,
-inbound, intended expiries, stage, panel binding hash and preservation hash.
-It contains no token/cookies/CSRF/links/raw payloads. An exclusive ignored lock
-serializes CLI runs. Atomic flushed intent is saved before mutation; crashes leave
-ATTEMPTED/REVIEW, which cannot re-run the mutation. Missing/corrupt state stops
-non-dry stages. A stale lock requires manual journal review, not automatic removal.
-Keep the journal after cleanup as local evidence; it is not automatically regenerated.
+Safe metadata only: response_received, HTTP status, envelope_valid, success,
+obj shape, nodePending presence/value and valid_mutation_response. No raw body,
+API token, cookies, CSRF, full credential UUID/subId or share link is committed.
 
-## HTTP guard and verification
+Ignored files: .xui-write-smoke-390-state.json, its lock/temp file and
+.xui-write-smoke-390-outcome.json. Historical .xui-write-smoke-state.json and
+outcome also remain ignored. Journals retain only local synthetic identity,
+planned expiries, panel binding/preservation hashes and stage. Durable intent
+before mutation blocks replay after crash. Keep these files locally as evidence;
+they are not fixtures or commit inputs. CLEANUP_PASS is terminal and blocks cleanup replay.
 
-Every stage has an exact method/path allowlist bound to its generated identity.
-Only that stage's mutation is permitted; a body guard must be armed after durable
-intent and fresh checks. Maximum one mutation attempt per command. No redirects,
-proxy-env trust, cookies, login, CSRF bootstrap, TLS bypass or HTTP retries.
-The locked aiohttp idempotent transport retry is disabled within each sequential
-request; physical POST counts are asserted by loopback tests.
+## Limits and local regression
 
-Preflight requires exact panel/core versions, running Xray, enabled inbound,
-VLESS/Reality/XHTTP capability and canonical test-email NOT FOUND. HTTP 404 of a
-missing API route is not accepted as proof of email absence. An existing test
-email blocks create; no automatic reuse/update/delete.
+There is no panel UUID-conditioned delete or HTTP compare-and-set; an external
+edit after our fresh GET remains a race. Do not edit the synthetic client during
+an approved trial. Canonical absence is not Xray/node removal confirmation.
+HTTP subscription routing, VPN handshake, Telegram E2E and payment pilot remain
+outside this completed panel lifecycle smoke.
 
-Create uses runtime XUIAdapter.add_client with one explicit membership. Canonical
-reconciliation confirms persisted fields; a validated add/update response with
-obj=null or explicit nodePending=false allows CREATE_PASS. True/None requires review. Later read-only
-verification cannot promote uncertain activation or unlock update.
-
-Verify stages check canonical identity/expiry/settings, numeric traffic separately,
-panel subURI and share-link UUID/XHTTP/Reality/empty flow without printing URLs.
-They allow the source-confirmed read-only POST /panel/api/setting/all, with {} body,
-and GET /clients/subLinks/{state-subId}; these are not in preflight's allowlist.
-Canonical GETs can repeat as distinct pre-check/reconciliation operations, not retries.
-
-An optional separately approved `--fetch-subscription` on a verification stage
-performs one HTTPS GET to the exact canonical-subId URL. It sends no panel Bearer
-or cookies, follows no redirect, bounds the body to 1 MiB, checks plain/base64 VLESS
-links in memory and saves no body. This fetch can update panel access/HWID bookkeeping;
-it is NOT implicitly authorized by a panel-read approval. No Xray handshake occurs.
-Default verification reports HTTP subscription fetch NOT RUN; this is still required
-before claiming complete functional subscription success.
-
-Update preserves the full serializer contract and exact membership. It changes
-only expiry by +1 day. A hash of the preserved client payload (excluding expiry)
-detects edits across stages, in addition to adapter stale snapshot checks.
-
-## Source-verified cleanup
-
-[v3.8.5 client controller](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/client.go):
-POST /panel/api/clients/del/{email}, no request body, no query parameters here.
-keepTraffic=1 is optional upstream; the smoke omits it (false).
-Response is jsonMsg success/msg/obj=null, without a nodePending confirmation.
-
-## Patch 6D.1 local correction (no production requests)
-
-The add/update normal response is success=true,obj=null: pendingNodeObj(false)
-returns nil, so a received valid response means node_pending=False. A true flag
-means pending work. Other object shapes are unsupported and conservatively
-reconcile persistence without establishing activation. Lost, malformed or rejected
-responses remain node_pending=None even if canonical GET matches.
-
-Future CLI mutations record safe response metadata in the separate gitignored
-.xui-write-smoke-outcome.json: response_received, HTTP status, envelope validity,
-success, obj shape and nodePending presence/boolean value. No body, token or client
-credentials are stored. This artifact is produced only for a newly executed
-mutation stage; this patch did not run any production stage or create that file.
-
-Historical CREATE_REVIEW remains unchanged: the original response metadata was
-not recorded, so its classification cannot be reconstructed from persistence.
-The UPDATE journal gate remains closed; a separate explicit manual recovery
-decision and stage authorization are required before any controlled trial.
-
-[Delete/DeleteByEmail service](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/client_crud.go):
-delete fans out to all client attachments, then removes canonical identity, links,
-HWID and traffic bookkeeping; partial failure may leave applied changes.
-It is not a detach-one-inbound API. Cleanup therefore re-reads and requires exact
-state email/UUID/subId and membership (6,) before the only deletion POST.
-
-Deletion is smoke-local; no delete method is added to the runtime adapter.
-After any response/error, canonical GET is attempted once: NOT FOUND confirms
-persistence deletion only, activation UNKNOWN. Still present/unreadable requires
-manual review. No retry even on a later cleanup command. Separate --verify-cleanup
-checks absence without mutation.
-
-## Remaining operational limitations
-
-Backend has no UUID-conditioned atomic delete or client compare-and-set. An external
-panel edit between fresh GET and POST remains a race: do not edit/attach this
-synthetic client during the trial. The guard cannot make the panel atomic.
-Journal loss or uncertain activation needs manual reconciliation; do not edit the
-journal to force a retry. Canonical absence is not proof of Xray/node removal.
-Network/TLS/subscription routing and VPN handshake have not been tested live here.
-
-## Local tests
-
-Locked Python 3.12.12: full unittest suite 213 passed, 0 skips (30 new smoke tests).
-poetry check --lock, pip check and git diff --check passed; Poetry emits existing
-metadata deprecation warnings. Loopback tests cover stages, counts, payload,
-preservation, ambiguity, cleanup identity/membership refusal, no transport replay
-and safe output. No production response or credential is used as a fixture.
-The suite includes journal failures
-before/after POST: counters remain available and durable ATTEMPTED blocks replay.
+Tests use synthetic loopback responses only; v3.8.5 fixtures are retained and
+v3.9.0 fixtures cover weekday preservation, visibility and response contracts.
+See the commit review report for the final locked-environment suite results.

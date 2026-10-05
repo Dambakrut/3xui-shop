@@ -161,6 +161,9 @@ CLIENT_WRITE_DEFAULTS = {
     "keepAlive": 0, "forwardedPorts": "", "secret": "", "adTag": "", "group": "",
     "resetDay": 0, "resetMax": 0, "trafficReset": "never", "trafficResetDay": 1,
 }
+# Added by panel v3.9.0. Optional for v3.8.5 canonical responses; preserve it
+# when supplied, without requiring old fixtures/panels to grow a new field.
+OPTIONAL_CLIENT_WRITE_DEFAULTS = {"resetWeekday": 0}
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +195,7 @@ class XUIClientWrite:
                        (self.total_bytes, self.limit_ip, self.limit_hwid, self.tg_id))
                 or type(self.enable) is not bool):
             raise ValueError("Invalid client write fields")
-        if set(self.preserved) - CLIENT_WRITE_FIELDS:
+        if set(self.preserved) - (CLIENT_WRITE_FIELDS | OPTIONAL_CLIENT_WRITE_DEFAULTS.keys()):
             raise ValueError("Unsupported preserved client field")
         for key, value in self.preserved.items():
             if key == "reverse":
@@ -201,7 +204,10 @@ class XUIClientWrite:
             elif key == "allowedIPs":
                 valid = isinstance(value, list) and all(isinstance(i, str) for i in value)
             else:
-                valid = type(value) is type(CLIENT_WRITE_DEFAULTS[key])
+                default = (CLIENT_WRITE_DEFAULTS | OPTIONAL_CLIENT_WRITE_DEFAULTS)[key]
+                valid = type(value) is type(default)
+            if key == "resetWeekday":
+                valid = valid and 0 <= value <= 7
             if not valid:
                 raise XUIProtocolError("Invalid preserved client field")
         object.__setattr__(self, "preserved", deepcopy(self.preserved))
@@ -217,7 +223,9 @@ class XUIClientWrite:
                     limit_ip: int, enable: bool) -> XUIClientWrite:
         if CLIENT_WRITE_FIELDS - client.raw.keys():
             raise XUIProtocolError("Canonical client lacks preservation fields")
-        preserved = deepcopy({key: client.raw[key] for key in CLIENT_WRITE_FIELDS if key in client.raw})
+        preserved = deepcopy({key: client.raw[key] for key in
+                              CLIENT_WRITE_FIELDS | OPTIONAL_CLIENT_WRITE_DEFAULTS.keys()
+                              if key in client.raw})
         # ClientRecord stores this as JSON text; model.Client accepts []string.
         if "allowedIPs" in preserved:
             value = preserved["allowedIPs"]

@@ -184,3 +184,9 @@ tmp_test/
 .xui-write-smoke-state.json.tmp
 .xui-write-smoke-state.lock
 .xui-write-smoke-outcome.json
+
+# Separate 3.9.0 trial; historical 3.8.5 journal remains untouched.
+.xui-write-smoke-390-state.json
+.xui-write-smoke-390-state.json.tmp
+.xui-write-smoke-390-state.lock
+.xui-write-smoke-390-outcome.json

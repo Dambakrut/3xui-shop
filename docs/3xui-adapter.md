@@ -1,7 +1,34 @@
 # 3x-ui 3.8.5 adapter — Patch 6B.2b
 
-Target: MHSanaei/3x-ui v3.8.5; reported production Xray Core 26.9.30.
-Source/local tests only. No production requests or live writes performed.
+Supported source/local contracts: MHSanaei/3x-ui v3.8.5 and v3.9.0;
+Xray Core baseline 26.9.30. A separately approved v3.9.0 live panel lifecycle
+completed create/read/update/read/delete on one synthetic client. See
+[smoke evidence and limits](3xui-live-write-smoke.md). HTTP subscription fetch,
+VPN handshake, Telegram E2E and real payments were not tested.
+
+## Patch 6E — v3.9.0 compatibility
+
+See [complete tag delta audit](3xui-390-audit.md) for API matrix, source links,
+model/migration changes, node-counter semantics and concurrency limitations.
+
+| Contract | v3.8.5 | v3.9.0 |
+|---|---|---|
+| Bearer/admin scope, CSRF bypass, custom base path | Supported | Unchanged |
+| Canonical UUID / numeric traffic ID / all memberships | Separate | Unchanged |
+| Add/update null success => no pending work | Supported after 6D.1 | Unchanged |
+| Lost/invalid response + reconciled state | Activation unknown | Unchanged |
+| Delete null acknowledgement | No pending confirmation | Unchanged |
+| VLESS Reality XHTTP, empty flow | Supported | Source/local and controlled live verified |
+| Full client preservation | Existing fields | Adds optional resetWeekday preservation |
+| Subscription visibility | Enabled inbound | Also inspect excludeFromSub |
+| HTTP subscription URL | subURI / explicit HTTPS base | Unchanged |
+
+v3.9.0 adds weekly calendar renewal and calculation-only renewalPreview, not
+a replacement paid-renewal endpoint. Server three-way settings merge does not
+replace the shop stale-snapshot check or provide a GET-to-POST CAS guarantee.
+Prepared read-only script takes explicit --panel-version 3.9.0, checks current
+capability/visibility, and retains its exact request allowlist. Preparing this
+option does not authorize a live run. The fresh write-smoke journal explicitly pins 3.9.0; historical 3.8.5 evidence is kept separate.
 
 ## Runtime integration status
 
@@ -11,7 +38,7 @@ WRITE PATH: MODERN XUIAdapter
 
 LEGACY py3xui: NOT USED FOR PANEL RUNTIME OPERATIONS
 
-LIVE PRODUCTION WRITE: NOT TESTED
+LIVE PANEL LIFECYCLE: VERIFIED ON 3.9.0 WITH ONE SYNTHETIC CLIENT; CLEANUP COMPLETE
 
 ServerPoolService owns one adapter/session per server. Startup remains read-only:
 authenticate, require panel 3.8.5/running Xray, validate enabled configured inbound
